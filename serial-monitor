@@ -1,0 +1,32 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mat McGowan
+# serial-monitor — Serial monitor with device reset and bootloader support
+#
+# Wrapper that runs serial_monitor.py using the PlatformIO venv (for pyserial).
+# Resolves device type from usb-device config and passes it to the Python script.
+#
+# Usage:
+#   serial-monitor [options] [device-name-or-port]
+#   serial-monitor "1.9"                  # monitor by device name (fuzzy match)
+#   serial-monitor "1.9" --timeout 30     # capture for 30s then exit
+#   serial-monitor "1.9" --reset          # reset device before monitoring
+#   serial-monitor "1.9" --send T --timeout 10  # send 'T' then capture 10s
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PIO_PYTHON="${HOME}/.platformio/penv/bin/python3"
+
+if [ ! -x "$PIO_PYTHON" ]; then
+    echo "error: PlatformIO python not found at $PIO_PYTHON" >&2
+    echo "Install PlatformIO or set PIO_PYTHON to the correct path." >&2
+    exit 1
+fi
+
+# Resolve device type if the first arg looks like a device name (not a port or flag)
+DEVICE_TYPE_ARGS=()
+if [ -n "${1:-}" ] && [[ "$1" != /dev/* ]] && [[ "$1" != -* ]]; then
+    DEVICE_TYPE=$("$SCRIPT_DIR/usb-device" type "$1" 2>/dev/null || true)
+    [ -n "$DEVICE_TYPE" ] && DEVICE_TYPE_ARGS=(--device-type "$DEVICE_TYPE")
+fi
+
+exec "$PIO_PYTHON" -u "${SCRIPT_DIR}/serial_monitor.py" "${DEVICE_TYPE_ARGS[@]}" "$@"

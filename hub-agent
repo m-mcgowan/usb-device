@@ -1,0 +1,27 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mat McGowan
+# hub-agent — USB Insight Hub display agent
+#
+# Wrapper that runs hub_agent.py using the PlatformIO venv (for pyserial).
+#
+# Usage:
+#   hub-agent                     # watch mode (continuous updates)
+#   hub-agent --once              # sync once and exit
+#   hub-agent --status            # print hub status and exit
+#
+# Prefer using via usb-device:
+#   usb-device hub watch
+#   usb-device hub sync
+#   usb-device hub status
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PIO_PYTHON="${HOME}/.platformio/penv/bin/python3"
+
+if [ ! -x "$PIO_PYTHON" ]; then
+    echo "error: PlatformIO python not found at $PIO_PYTHON" >&2
+    echo "Install PlatformIO or set PIO_PYTHON to the correct path." >&2
+    exit 1
+fi
+
+exec "$PIO_PYTHON" -u "${SCRIPT_DIR}/hub_agent.py" "$@"

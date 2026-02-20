@@ -1,0 +1,1266 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mat McGowan
+# usb-device — look up and manage named USB devices via uhubctl
+#
+# Usage:
+#   usb-device list                  # show all registered devices and their status
+#   usb-device scan                  # scan bus and update last-known locations
+#   usb-device find "1.9"            # show hub/port/serial (substring match)
+#   usb-device reset "dev"           # power-cycle a device (escalates to hub if needed)
+#   usb-device reset -f "dev"        # force reset (skip hub confirmation)
+#   usb-device off "MPCB.*Dev"       # turn off power (regex match)
+#   usb-device on "1.9"              # turn on power to a device
+#   usb-device port "1.9"            # print /dev/cu.* path
+#   usb-device partners "1.9"        # list partner devices for a board
+#
+# Config supports INI-style sections with partner devices:
+#   [MPCB 1.9 Development]
+#   mac=B8:F8:62:D2:2A:FC
+#   type=esp32
+#
+#   [MPCB 1.9 Development:ppk2]
+#   serial=C9F6358AC307
+#   type=ppk2
+#
+# Legacy flat format still works: NAME=MAC (treated as type=generic)
+#
+# Device names support fuzzy matching:
+#   - Exact match tried first (case-insensitive)
+#   - If pattern contains regex chars: matched as regex
+#   - Otherwise: matched as case-insensitive substring
+#   - Multiple matches: interactive selection prompt
+#   - No matches: shows list of known devices
+
+CONF="${USB_DEVICE_CONF:-$HOME/.config/usb-devices/devices.conf}"
+DB="${USB_DEVICE_DB:-$HOME/.config/usb-devices/locations.json}"
+
+# Use PlatformIO venv python (has pyserial), fall back to system python3
+if [ -x "$HOME/.platformio/penv/bin/python3" ]; then
+    PYTHON="$HOME/.platformio/penv/bin/python3"
+else
+    PYTHON="python3"
+fi
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Globals set by resolve_device()
+RESOLVED_NAME=""
+RESOLVED_MAC=""
+RESOLVED_TYPE=""
+RESOLVED_LOCATION=""
+RESOLVED_CHIP=""
+RESOLVED_HUB_NAME=""
+
+# ── Type plugin loading ────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TYPE_PLUGIN_DIRS=(
+    "${SCRIPT_DIR}/types.d"
+    "${HOME}/.config/usb-devices/types.d"
+)
+
+# Source a type plugin. Returns 0 if found, 1 if not.
+# After loading, type_<name>_* functions are available.
+load_type_plugin() {
+    local type_name="$1"
+    [ -n "$type_name" ] && [ "$type_name" != "generic" ] || return 1
+    local dir
+    for dir in "${TYPE_PLUGIN_DIRS[@]}"; do
+        if [ -f "$dir/${type_name}.sh" ]; then
+            source "$dir/${type_name}.sh"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── Database helpers ──────────────────────────────────────────────
+
+# Ensure the DB file exists with an empty JSON object
+db_init() {
+    [ -f "$DB" ] || echo '{}' > "$DB"
+}
+
+# Read a field from the DB for a device name
+# Usage: db_get "MPCB 1.9 Development" "hub"
+db_get() {
+    db_init
+    jq -r --arg name "$1" --arg field "$2" '.[$name][$field] // empty' "$DB"
+}
+
+# Update the DB: merge a device entry
+# Usage: db_put "name" "mac" "hub" "port" "link" "serial_port"
+db_put() {
+    db_init
+    local name="$1" mac="$2" hub="$3" port="$4" link="$5" serial_port="$6"
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local tmp="${DB}.tmp.$$"
+    jq --arg name "$name" \
+       --arg mac "$mac" \
+       --arg hub "$hub" \
+       --arg port "$port" \
+       --arg link "$link" \
+       --arg dev "$serial_port" \
+       --arg ts "$now" \
+       '.[$name] = {mac: $mac, hub: $hub, port: $port, link: $link, dev: $dev, last_seen: $ts}' \
+       "$DB" > "$tmp" && mv "$tmp" "$DB"
+}
+
+# Remove any DB entry that occupies a given hub:port (evict old device)
+db_evict_port() {
+    local hub="$1" port="$2" except_name="$3"
+    db_init
+    local tmp="${DB}.tmp.$$"
+    jq --arg hub "$hub" --arg port "$port" --arg except "$except_name" \
+       'to_entries | map(select(
+            .value.hub != $hub or .value.port != $port or .key == $except
+        )) | from_entries' \
+       "$DB" > "$tmp" && mv "$tmp" "$DB"
+}
+
+# List all devices in DB that are on a given hub (optionally excluding one port)
+# Outputs: "name|port" lines
+db_devices_on_hub() {
+    local hub="$1" exclude_port="${2:-}"
+    db_init
+    jq -r --arg hub "$hub" --arg ep "$exclude_port" \
+       'to_entries[] | select(.value.hub == $hub and .value.port != $ep) |
+        "\(.key)|\(.value.port)"' "$DB"
+}
+
+# ── Config parser (INI + legacy flat format) ─────────────────────
+#
+# Populates parallel arrays:
+#   DEVICE_NAMES[i]     — device name (section header or flat line name)
+#   DEVICE_MACS[i]      — serial number (from mac=, serial=, or flat line)
+#   DEVICE_TYPES[i]     — esp32, ppk2, power (default: esp32)
+#   DEVICE_LOCATIONS[i] — static USB location (for type=power)
+#
+DEVICE_NAMES=()
+DEVICE_MACS=()
+DEVICE_TYPES=()
+DEVICE_LOCATIONS=()
+DEVICE_CHIPS=()
+DEVICE_HUB_NAMES=()
+CONFIG_PARSED=0
+
+# Hub config (from [hub:insight] sections)
+HUB_CONF_PORT=""       # CDC serial port for Insight Hub
+HUB_CONF_LOCATION=""   # uhubctl hub ID for Insight Hub
+
+_flush_section() {
+    local name="$1" mac="$2" type="$3" location="$4" chip="$5" hub_name="$6"
+    [ -n "$name" ] || return 0
+
+    # [hub:*] sections are hub config, not devices
+    if [[ "$name" == hub:* ]]; then
+        [ -n "$location" ] && HUB_CONF_LOCATION="$location"
+        [ -n "$mac" ] && HUB_CONF_PORT="$mac"  # port= stored in mac slot
+        return 0
+    fi
+
+    DEVICE_NAMES+=("$name")
+    DEVICE_MACS+=("$mac")
+    DEVICE_TYPES+=("${type:-generic}")
+    DEVICE_LOCATIONS+=("$location")
+    DEVICE_CHIPS+=("$chip")
+    DEVICE_HUB_NAMES+=("$hub_name")
+}
+
+parse_config() {
+    [ "$CONFIG_PARSED" -eq 0 ] || return 0
+    CONFIG_PARSED=1
+
+    DEVICE_NAMES=()
+    DEVICE_MACS=()
+    DEVICE_TYPES=()
+    DEVICE_LOCATIONS=()
+    DEVICE_CHIPS=()
+    DEVICE_HUB_NAMES=()
+    HUB_CONF_PORT=""
+    HUB_CONF_LOCATION=""
+
+    [ -f "$CONF" ] || return 0
+
+    local section="" sec_mac="" sec_type="" sec_location="" sec_chip="" sec_hub_name=""
+
+    while IFS= read -r line; do
+        # Strip leading/trailing whitespace
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+
+        # Skip comments and blank lines
+        [[ "$line" =~ ^# || -z "$line" ]] && continue
+
+        # Section header: [Name]
+        if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+            _flush_section "$section" "$sec_mac" "$sec_type" "$sec_location" "$sec_chip" "$sec_hub_name"
+            section="${BASH_REMATCH[1]}"
+            sec_mac="" sec_type="" sec_location="" sec_chip="" sec_hub_name=""
+            continue
+        fi
+
+        # Key=value inside a section
+        if [ -n "$section" ] && [[ "$line" == *=* ]]; then
+            local key="${line%%=*}" val="${line#*=}"
+            key="${key#"${key%%[![:space:]]*}"}" key="${key%"${key##*[![:space:]]}"}"
+            val="${val#"${val%%[![:space:]]*}"}" val="${val%"${val##*[![:space:]]}"}"
+            case "$key" in
+                mac|serial) sec_mac="$val" ;;
+                type)       sec_type="$val" ;;
+                location)   sec_location="$val" ;;
+                chip)       sec_chip="$val" ;;
+                hub_name)   sec_hub_name="$val" ;;
+                port)       sec_mac="$val" ;;  # [hub:*] uses port= for CDC serial path
+            esac
+            continue
+        fi
+
+        # Legacy flat format: NAME=MAC (only outside sections)
+        if [ -z "$section" ] && [[ "$line" == *=* ]]; then
+            local flat_name="${line%%=*}" flat_mac="${line#*=}"
+            _flush_section "$flat_name" "$flat_mac" "" "" "" ""
+        fi
+    done < "$CONF"
+
+    # Flush last section
+    _flush_section "$section" "$sec_mac" "$sec_type" "$sec_location" "$sec_chip" "$sec_hub_name"
+}
+
+# List all device names
+all_device_names() {
+    parse_config
+    local i
+    for i in "${!DEVICE_NAMES[@]}"; do
+        echo "${DEVICE_NAMES[$i]}"
+    done
+}
+
+# Check if a string contains regex special characters
+is_regex() {
+    [[ "$1" =~ [\[\]\(\)\{\}\.\*\+\?\^\$\|\\] ]]
+}
+
+# Resolve a device pattern to RESOLVED_NAME, RESOLVED_MAC, RESOLVED_TYPE, RESOLVED_LOCATION.
+# Supports exact, substring, and regex matching with interactive selection.
+resolve_device() {
+    parse_config
+    local pattern="$1"
+    RESOLVED_NAME=""
+    RESOLVED_MAC=""
+    RESOLVED_TYPE=""
+    RESOLVED_LOCATION=""
+    RESOLVED_CHIP=""
+    RESOLVED_HUB_NAME=""
+
+    local i
+
+    # Helper to set all resolved globals from index
+    _resolve_from_index() {
+        local idx="$1"
+        RESOLVED_NAME="${DEVICE_NAMES[$idx]}"
+        RESOLVED_MAC="${DEVICE_MACS[$idx]}"
+        RESOLVED_TYPE="${DEVICE_TYPES[$idx]}"
+        RESOLVED_LOCATION="${DEVICE_LOCATIONS[$idx]}"
+        RESOLVED_CHIP="${DEVICE_CHIPS[$idx]}"
+        RESOLVED_HUB_NAME="${DEVICE_HUB_NAMES[$idx]}"
+    }
+
+    # Exact match (case-insensitive)
+    for i in "${!DEVICE_NAMES[@]}"; do
+        if echo "${DEVICE_NAMES[$i]}" | grep -iqx "$pattern"; then
+            _resolve_from_index "$i"
+            return 0
+        fi
+    done
+
+    # Fuzzy match: regex if special chars detected, otherwise case-insensitive substring
+    local -a matches=() match_indices=()
+
+    if is_regex "$pattern"; then
+        for i in "${!DEVICE_NAMES[@]}"; do
+            if echo "${DEVICE_NAMES[$i]}" | grep -iqE "$pattern"; then
+                matches+=("${DEVICE_NAMES[$i]}")
+                match_indices+=("$i")
+            fi
+        done
+    else
+        for i in "${!DEVICE_NAMES[@]}"; do
+            if echo "${DEVICE_NAMES[$i]}" | grep -iqF "$pattern"; then
+                matches+=("${DEVICE_NAMES[$i]}")
+                match_indices+=("$i")
+            fi
+        done
+    fi
+
+    if [ ${#matches[@]} -eq 0 ]; then
+        echo "No devices match '$pattern'" >&2
+        echo "" >&2
+        echo "Known devices:" >&2
+        all_device_names | while read -r n; do echo "  $n" >&2; done
+        exit 1
+    elif [ ${#matches[@]} -eq 1 ]; then
+        _resolve_from_index "${match_indices[0]}"
+        return 0
+    else
+        echo "Multiple devices match '$pattern':" >&2
+        for i in "${!matches[@]}"; do
+            echo "  $((i+1))) ${matches[$i]}" >&2
+        done
+        printf "Select [1-%d]: " "${#matches[@]}" >&2
+        local choice
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#matches[@]} ]; then
+            _resolve_from_index "${match_indices[$((choice - 1))]}"
+            return 0
+        else
+            die "invalid selection"
+        fi
+    fi
+}
+
+# ── USB discovery ─────────────────────────────────────────────────
+
+# Find hub and port for a MAC address (live lookup).
+# First tries uhubctl directly. If the device is behind a ganged sub-hub,
+# falls back to pyserial's LOCATION field to find the nearest controllable port.
+find_hub_port_live() {
+    local mac="$1"
+
+    # Try direct match in uhubctl output
+    local hub="" port=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ "hub " ]]; then
+            hub=$(echo "$line" | sed -E 's/.*hub ([^ ,]+).*/\1/')
+        fi
+        if [[ "$line" == *"$mac"* ]]; then
+            port=$(echo "$line" | sed -E 's/.*Port ([0-9]+).*/\1/')
+            echo "$hub $port direct"
+            return 0
+        fi
+    done < <(uhubctl 2>/dev/null)
+
+    # Fallback: use pyserial LOCATION to find nearest controllable hub/port
+    local location
+    location=$($PYTHON -c "
+from serial.tools.list_ports import comports
+for p in comports():
+    if p.serial_number == '$mac':
+        print(p.location or '')
+        break
+" 2>/dev/null)
+    [ -n "$location" ] || return 1
+
+    # Collect known uhubctl hub IDs
+    local -a known_hubs=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ "hub " ]]; then
+            known_hubs+=($(echo "$line" | sed -E 's/.*hub ([^ ,]+).*/\1/'))
+        fi
+    done < <(uhubctl 2>/dev/null)
+
+    # LOCATION e.g. "20-2.1.3" — find the longest matching hub prefix
+    # then the next segment is the port on that hub
+    local best_hub="" best_port=""
+    for h in "${known_hubs[@]}"; do
+        if [[ "$location" == "$h."* ]]; then
+            local remainder="${location#$h.}"
+            local first_port="${remainder%%.*}"
+            if [ -z "$best_hub" ] || [ ${#h} -gt ${#best_hub} ]; then
+                best_hub="$h"
+                best_port="$first_port"
+            fi
+        fi
+    done
+
+    if [ -n "$best_hub" ]; then
+        echo "$best_hub $best_port indirect"
+        return 0
+    fi
+
+    return 1
+}
+
+# Find hub and port: tries live first, falls back to DB
+find_hub_port() {
+    local mac="$1" name="${2:-}"
+    local result
+
+    if result=$(find_hub_port_live "$mac"); then
+        echo "$result"
+        return 0
+    fi
+
+    # Fall back to last-known location from DB
+    if [ -n "$name" ]; then
+        local db_hub db_port db_link
+        db_hub=$(db_get "$name" "hub")
+        db_port=$(db_get "$name" "port")
+        db_link=$(db_get "$name" "link")
+        if [ -n "$db_hub" ] && [ -n "$db_port" ]; then
+            echo "$db_hub $db_port ${db_link:-unknown} cached"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Find /dev/cu.* path for a MAC address via pyserial
+find_serial_port() {
+    local mac="$1"
+    $PYTHON -c "
+from serial.tools.list_ports import comports
+for p in comports():
+    if p.serial_number == '$mac':
+        print(p.device)
+        break
+" 2>/dev/null
+}
+
+# Parse a static location string (e.g. "20-2.3") into hub and port.
+# Location format: HUB.PORT where HUB may contain dots (e.g. "20-2.1.3" → hub=20-2.1, port=3)
+parse_static_location() {
+    local location="$1"
+    local hub="${location%.*}"
+    local port="${location##*.}"
+    echo "$hub $port"
+}
+
+# Resolve to hub/port, storing results in HUB, PORT, HOW globals.
+# Requires resolve_device() to have been called first.
+resolve_hub_port() {
+    # Static-location devices: use location directly
+    if [ -n "$RESOLVED_LOCATION" ]; then
+        read HUB PORT <<< "$(parse_static_location "$RESOLVED_LOCATION")"
+        HOW="static"
+        CACHED=""
+        return 0
+    fi
+
+    [ -n "$RESOLVED_MAC" ] || die "'$RESOLVED_NAME' has no serial number or location configured"
+
+    local result
+    result=$(find_hub_port "$RESOLVED_MAC" "$RESOLVED_NAME") || \
+        die "'$RESOLVED_NAME' ($RESOLVED_MAC) not found on any uhubctl-managed hub (and no last-known location in DB)"
+    read HUB PORT HOW CACHED <<< "$result"
+    if [ "$CACHED" = "cached" ]; then
+        echo "Note: using last-known location from DB (device not currently visible)" >&2
+    fi
+    [ "$HOW" = "indirect" ] && echo "Note: device is behind a sub-hub on port $PORT — this will affect all devices on that sub-hub" >&2
+}
+
+# Check if a device is responsive (has a serial port)
+device_is_alive() {
+    local mac="$1"
+    local port
+    port=$(find_serial_port "$mac")
+    [ -n "$port" ]
+}
+
+# ── Device locking (checkout/checkin) ─────────────────────────────
+#
+# Provides exclusive access to devices for CI jobs and manual use.
+# Lock is a directory under LOCK_DIR (atomic mkdir).
+# Lock metadata: PID, owner, timestamp, purpose, TTL.
+# Stale locks auto-reclaimed via PID liveness and TTL expiry.
+
+LOCK_DIR="${USB_DEVICE_LOCK_DIR:-/tmp/usb-device-locks}"
+
+# Sanitize a device name into a safe filename
+_lock_key() {
+    echo "$1" | tr ' /[:upper:]' '_-[:lower:]'
+}
+
+_lock_path() {
+    echo "$LOCK_DIR/$(_lock_key "$1")"
+}
+
+# Read a field from the lock info file
+_lock_field() {
+    local lock_path="$1" field="$2"
+    [ -f "$lock_path/info" ] || return 1
+    grep "^${field}=" "$lock_path/info" 2>/dev/null | cut -d= -f2-
+}
+
+# Check if a lock is stale and reclaim it if so. Returns 0 if reclaimed/absent.
+_try_reclaim_lock() {
+    local lock_path="$1"
+    [ -d "$lock_path" ] || return 0
+
+    local lock_pid lock_ts lock_ttl
+    lock_pid=$(_lock_field "$lock_path" "PID")
+    lock_ts=$(_lock_field "$lock_path" "TIMESTAMP")
+    lock_ttl=$(_lock_field "$lock_path" "TTL")
+
+    # PID dead? (kill -0 fails with EPERM if process exists but is owned by another user,
+    # and with ESRCH if the process doesn't exist. We only reclaim on ESRCH.)
+    if [ -n "$lock_pid" ]; then
+        if kill -0 "$lock_pid" 2>/dev/null; then
+            : # process is alive and accessible
+        elif kill -0 "$lock_pid" 2>&1 | grep -q "No such process"; then
+            local owner
+            owner=$(_lock_field "$lock_path" "OWNER")
+            echo "Reclaiming stale lock (PID $lock_pid dead, was: ${owner:-unknown})" >&2
+            rm -rf "$lock_path"
+            return 0
+        fi
+        # EPERM = process exists but owned by root/other — leave lock alone
+    fi
+
+    # TTL expired?
+    if [ -n "$lock_ts" ] && [ -n "$lock_ttl" ] && [ "$lock_ttl" -gt 0 ] 2>/dev/null; then
+        local now lock_epoch
+        now=$(date +%s)
+        # macOS date -jf for parsing, with fallback for GNU date
+        lock_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$lock_ts" +%s 2>/dev/null) || \
+            lock_epoch=$(date -d "$lock_ts" +%s 2>/dev/null) || \
+            return 1
+        if [ $((now - lock_epoch)) -gt "$lock_ttl" ]; then
+            local owner age
+            owner=$(_lock_field "$lock_path" "OWNER")
+            age=$((now - lock_epoch))
+            echo "Reclaiming expired lock (age ${age}s > TTL ${lock_ttl}s, was: ${owner:-unknown})" >&2
+            rm -rf "$lock_path"
+            return 0
+        fi
+    fi
+
+    return 1  # lock is valid, not reclaimed
+}
+
+# Print lock info to stderr
+_show_lock_holder() {
+    local lock_path="$1"
+    [ -f "$lock_path/info" ] || return
+    local owner pid purpose ts ttl
+    owner=$(_lock_field "$lock_path" "OWNER")
+    pid=$(_lock_field "$lock_path" "PID")
+    purpose=$(_lock_field "$lock_path" "PURPOSE")
+    ts=$(_lock_field "$lock_path" "TIMESTAMP")
+    ttl=$(_lock_field "$lock_path" "TTL")
+    echo "  owner:   ${owner:--}" >&2
+    echo "  pid:     ${pid:--}" >&2
+    [ -n "$purpose" ] && echo "  purpose: $purpose" >&2
+    echo "  since:   ${ts:--}" >&2
+    [ -n "$ttl" ] && [ "$ttl" -gt 0 ] 2>/dev/null && echo "  ttl:     ${ttl}s" >&2
+}
+
+cmd_checkout() {
+    local wait=0 timeout=0 owner="" purpose="" ttl="1800"
+
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            --wait)    wait=1; shift ;;
+            --timeout) timeout="$2"; shift 2 ;;
+            --owner)   owner="$2"; shift 2 ;;
+            --purpose) purpose="$2"; shift 2 ;;
+            --ttl)     ttl="$2"; shift 2 ;;
+            *)         die "unknown flag: $1" ;;
+        esac
+    done
+    [ -n "${1:-}" ] || die "usage: usb-device checkout [--wait] [--timeout N] [--owner STR] [--purpose STR] [--ttl N] <name>"
+
+    resolve_device "$1"
+    mkdir -p "$LOCK_DIR"
+
+    local lock_path
+    lock_path=$(_lock_path "$RESOLVED_NAME")
+    [ -n "$owner" ] || owner="$(whoami)@$(hostname -s)"
+
+    local deadline=0
+    [ "$wait" -eq 1 ] && [ "$timeout" -gt 0 ] && deadline=$(( $(date +%s) + timeout ))
+
+    while true; do
+        # Try to reclaim stale lock
+        _try_reclaim_lock "$lock_path"
+
+        # Atomic acquire
+        if mkdir "$lock_path" 2>/dev/null; then
+            cat > "$lock_path/info" <<EOF
+PID=$$
+OWNER=$owner
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=$purpose
+TTL=$ttl
+EOF
+            echo "Checked out '$RESOLVED_NAME'" >&2
+            return 0
+        fi
+
+        # Lock held — wait or fail
+        if [ "$wait" -eq 0 ]; then
+            echo "Device '$RESOLVED_NAME' is checked out:" >&2
+            _show_lock_holder "$lock_path"
+            return 1
+        fi
+
+        if [ "$deadline" -gt 0 ] && [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "Timed out waiting for '$RESOLVED_NAME' (${timeout}s):" >&2
+            _show_lock_holder "$lock_path"
+            return 1
+        fi
+
+        # Poll every 5 seconds
+        sleep 5
+    done
+}
+
+cmd_checkin() {
+    local force=0
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            -f|--force) force=1; shift ;;
+            *)          die "unknown flag: $1" ;;
+        esac
+    done
+    [ -n "${1:-}" ] || die "usage: usb-device checkin [-f|--force] <name>"
+
+    resolve_device "$1"
+
+    local lock_path
+    lock_path=$(_lock_path "$RESOLVED_NAME")
+
+    if [ ! -d "$lock_path" ]; then
+        echo "Device '$RESOLVED_NAME' is not checked out" >&2
+        return 0
+    fi
+
+    # Only the owner PID can release (unless forced or PID dead)
+    if [ "$force" -eq 0 ]; then
+        local lock_pid
+        lock_pid=$(_lock_field "$lock_path" "PID")
+        if [ -n "$lock_pid" ] && [ "$lock_pid" != "$$" ]; then
+            # Check if the owning process is still alive
+            local pid_alive=0
+            if kill -0 "$lock_pid" 2>/dev/null; then
+                pid_alive=1
+            elif ! kill -0 "$lock_pid" 2>&1 | grep -q "No such process"; then
+                pid_alive=1  # EPERM — process exists but owned by another user
+            fi
+            if [ "$pid_alive" -eq 1 ]; then
+                echo "Device '$RESOLVED_NAME' is checked out by another process:" >&2
+                _show_lock_holder "$lock_path"
+                echo "Use -f to force release" >&2
+                return 1
+            fi
+        fi
+    fi
+
+    rm -rf "$lock_path"
+    echo "Checked in '$RESOLVED_NAME'" >&2
+    return 0
+}
+
+cmd_locks() {
+    mkdir -p "$LOCK_DIR"
+    parse_config
+
+    local has_locks=0
+    local i
+    for i in "${!DEVICE_NAMES[@]}"; do
+        local name="${DEVICE_NAMES[$i]}"
+        local lock_path
+        lock_path=$(_lock_path "$name")
+
+        if [ -d "$lock_path" ]; then
+            # Try to reclaim stale before displaying
+            if _try_reclaim_lock "$lock_path"; then
+                continue  # was stale, now gone
+            fi
+            has_locks=1
+            local owner pid purpose ts ttl
+            owner=$(_lock_field "$lock_path" "OWNER")
+            pid=$(_lock_field "$lock_path" "PID")
+            purpose=$(_lock_field "$lock_path" "PURPOSE")
+            ts=$(_lock_field "$lock_path" "TIMESTAMP")
+            ttl=$(_lock_field "$lock_path" "TTL")
+
+            local age_str=""
+            if [ -n "$ts" ]; then
+                local lock_epoch now
+                now=$(date +%s)
+                lock_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null) || \
+                    lock_epoch=$(date -d "$ts" +%s 2>/dev/null) || lock_epoch=0
+                if [ "$lock_epoch" -gt 0 ]; then
+                    local age=$((now - lock_epoch))
+                    if [ "$age" -lt 60 ]; then
+                        age_str="${age}s"
+                    elif [ "$age" -lt 3600 ]; then
+                        age_str="$((age / 60))m"
+                    else
+                        age_str="$((age / 3600))h$((age % 3600 / 60))m"
+                    fi
+                fi
+            fi
+
+            local detail="${owner:-?}"
+            [ -n "$purpose" ] && detail="$detail ($purpose)"
+            [ -n "$age_str" ] && detail="$detail, ${age_str} ago"
+            [ -n "$pid" ] && detail="$detail, pid=$pid"
+
+            printf "  %-30s  LOCKED  %s\n" "$name" "$detail"
+        fi
+    done
+
+    if [ "$has_locks" -eq 0 ]; then
+        echo "No devices are checked out."
+    fi
+}
+
+# Warn (to stderr) if a device is checked out by someone else.
+# Called by mutating commands (reset, off, on, bootloader, boot) as advisory.
+check_lock_warning() {
+    local name="$1"
+    local lock_path
+    lock_path=$(_lock_path "$name")
+    [ -d "$lock_path" ] || return 0
+    [ -f "$lock_path/info" ] || return 0
+
+    local lock_pid
+    lock_pid=$(_lock_field "$lock_path" "PID")
+    # Don't warn if we hold the lock
+    [ "$lock_pid" = "$$" ] && return 0
+
+    local owner
+    owner=$(_lock_field "$lock_path" "OWNER")
+    echo "WARNING: '$name' is checked out by ${owner:-unknown} (pid ${lock_pid:-?})" >&2
+}
+
+# ── Commands ──────────────────────────────────────────────────────
+
+cmd_check() {
+    local ok=0 fail=0
+
+    # Python with pyserial
+    if $PYTHON -c "from serial.tools.list_ports import comports; comports()" &>/dev/null; then
+        echo "[ok] python + pyserial ($PYTHON)"
+        ok=$((ok + 1))
+    else
+        echo "[FAIL] python + pyserial ($PYTHON)"
+        fail=$((fail + 1))
+    fi
+
+    # jq
+    if command -v jq &>/dev/null; then
+        echo "[ok] jq ($(which jq))"
+        ok=$((ok + 1))
+    else
+        echo "[FAIL] jq not found"
+        fail=$((fail + 1))
+    fi
+
+    # uhubctl
+    if command -v uhubctl &>/dev/null; then
+        echo "[ok] uhubctl ($(which uhubctl))"
+        ok=$((ok + 1))
+        # Check sudo access
+        if sudo -n uhubctl &>/dev/null 2>&1 || sudo -n uhubctl 2>&1 | grep -q "hub"; then
+            echo "[ok] uhubctl sudo (passwordless)"
+            ok=$((ok + 1))
+        else
+            echo "[warn] uhubctl sudo requires password — run setup.sh to fix"
+        fi
+    else
+        echo "[FAIL] uhubctl not found — brew install uhubctl"
+        fail=$((fail + 1))
+    fi
+
+    # Config files
+    if [ -f "$CONF" ]; then
+        parse_config
+        echo "[ok] devices.conf (${#DEVICE_NAMES[@]} device(s) registered)"
+        ok=$((ok + 1))
+    else
+        echo "[FAIL] devices.conf not found at $CONF"
+        fail=$((fail + 1))
+    fi
+
+    if [ -f "$DB" ]; then
+        echo "[ok] locations.json"
+        ok=$((ok + 1))
+    else
+        echo "[warn] locations.json not found — run 'usb-device scan' to create"
+    fi
+
+    # Per-type plugin checks
+    if [ "$CONFIG_PARSED" -eq 1 ]; then
+        local checked_types=()
+        for i in "${!DEVICE_TYPES[@]}"; do
+            local t="${DEVICE_TYPES[$i]}"
+            [ "$t" = "generic" ] && continue
+            [[ " ${checked_types[*]:-} " == *" $t "* ]] && continue
+            checked_types+=("$t")
+
+            if load_type_plugin "$t"; then
+                if declare -f "type_${t}_check" >/dev/null 2>&1; then
+                    local type_fail=0
+                    "type_${t}_check" || type_fail=$?
+                    ok=$((ok + 1))
+                    fail=$((fail + type_fail))
+                fi
+            else
+                echo "[warn] no plugin for type=$t (used by ${DEVICE_NAMES[$i]})"
+            fi
+        done
+    fi
+
+    echo ""
+    if [ "$fail" -gt 0 ]; then
+        echo "$ok ok, $fail failed — run setup.sh to fix"
+        return 1
+    else
+        echo "All $ok checks passed."
+    fi
+}
+
+cmd_scan() {
+    parse_config
+    echo "Scanning USB bus..."
+    local found=0 updated=0
+    db_init
+
+    local i
+    for i in "${!DEVICE_NAMES[@]}"; do
+        local name="${DEVICE_NAMES[$i]}"
+        local mac="${DEVICE_MACS[$i]}"
+        local type="${DEVICE_TYPES[$i]}"
+        local location="${DEVICE_LOCATIONS[$i]}"
+
+        # Static-location devices: verify hub:port exists in uhubctl
+        if [ -n "$location" ]; then
+            local hub port
+            read hub port <<< "$(parse_static_location "$location")"
+            # Check if uhubctl can see this hub
+            if uhubctl -l "$hub" -p "$port" 2>/dev/null | grep -q "Port $port"; then
+                db_put "$name" "${mac:--}" "$hub" "$port" "static" "-"
+                printf "  %-30s  location=%-10s type=%-6s [verified]\n" "$name" "$location" "$type"
+                found=$((found + 1))
+                updated=$((updated + 1))
+            else
+                printf "  %-30s  location=%-10s type=%-6s [hub:port not found in uhubctl]\n" "$name" "$location" "$type"
+            fi
+            continue
+        fi
+
+        # Serial-number-based devices
+        local result serial_port
+        serial_port=$(find_serial_port "$mac")
+
+        if result=$(find_hub_port_live "$mac"); then
+            read hub port how <<< "$result"
+            db_evict_port "$hub" "$port" "$name"
+            db_put "$name" "$mac" "$hub" "$port" "$how" "${serial_port:--}"
+            printf "  %-30s  hub=%-6s port=%-4s dev=%-25s [found]\n" "$name" "$hub" "$port" "${serial_port:--}"
+            found=$((found + 1))
+            updated=$((updated + 1))
+        elif [ -n "$serial_port" ]; then
+            db_put "$name" "$mac" "-" "-" "no-hub" "${serial_port}"
+            printf "  %-30s  dev=%-25s [found, no power-switchable hub]\n" "$name" "$serial_port"
+            found=$((found + 1))
+            updated=$((updated + 1))
+        else
+            local cached_hub
+            cached_hub=$(db_get "$name" "hub")
+            if [ -n "$cached_hub" ]; then
+                local cached_port cached_ts
+                cached_port=$(db_get "$name" "port")
+                cached_ts=$(db_get "$name" "last_seen")
+                printf "  %-30s  hub=%-6s port=%-4s %s [cached from %s]\n" "$name" "$cached_hub" "$cached_port" "" "$cached_ts"
+            else
+                printf "  %-30s  %s\n" "$name" "[not found, no cached location]"
+            fi
+        fi
+    done
+
+    echo ""
+    echo "Scan complete: $found device(s) found, $updated location(s) updated."
+}
+
+cmd_list() {
+    parse_config
+    echo "Registered devices:"
+    echo ""
+
+    local i
+    for i in "${!DEVICE_NAMES[@]}"; do
+        local name="${DEVICE_NAMES[$i]}"
+        local mac="${DEVICE_MACS[$i]}"
+        local type="${DEVICE_TYPES[$i]}"
+        local location="${DEVICE_LOCATIONS[$i]}"
+
+        # Static-location devices
+        if [ -n "$location" ]; then
+            local hub port
+            read hub port <<< "$(parse_static_location "$location")"
+            local power_state=""
+            if uhubctl -l "$hub" -p "$port" 2>/dev/null | grep -q "power"; then
+                power_state="[power on]"
+                uhubctl -l "$hub" -p "$port" 2>/dev/null | grep -q "off" && power_state="[power off]"
+            fi
+            printf "  %-30s  type=%-6s location=%-10s %s\n" "$name" "$type" "$location" "$power_state"
+            continue
+        fi
+
+        # Serial-number-based devices
+        local result serial_port
+        serial_port=$(find_serial_port "$mac")
+        if result=$(find_hub_port_live "$mac"); then
+            read hub port how <<< "$result"
+            local label="[connected]"
+            [ "$how" = "indirect" ] && label="[connected via sub-hub]"
+            printf "  %-30s  type=%-6s id=%-20s  hub=%-6s port=%-4s dev=%-25s %s\n" "$name" "$type" "$mac" "$hub" "$port" "${serial_port:--}" "$label"
+        elif [ -n "$serial_port" ]; then
+            printf "  %-30s  type=%-6s id=%-20s  dev=%-25s %s\n" "$name" "$type" "$mac" "$serial_port" "[connected, no power-switchable hub]"
+        else
+            local db_hub db_port db_ts
+            db_hub=$(db_get "$name" "hub")
+            db_port=$(db_get "$name" "port")
+            db_ts=$(db_get "$name" "last_seen")
+            if [ -n "$db_hub" ] && [ "$db_hub" != "-" ]; then
+                printf "  %-30s  type=%-6s id=%-20s  hub=%-6s port=%-4s dev=%-25s [offline, last seen %s]\n" \
+                    "$name" "$type" "$mac" "$db_hub" "$db_port" "-" "$db_ts"
+            elif [ -n "$db_ts" ]; then
+                printf "  %-30s  type=%-6s id=%-20s  %s\n" "$name" "$type" "$mac" "[offline, last seen $db_ts]"
+            else
+                printf "  %-30s  type=%-6s id=%-20s  %s\n" "$name" "$type" "$mac" "[not found]"
+            fi
+        fi
+    done
+}
+
+cmd_find() {
+    resolve_device "$1"
+    resolve_hub_port
+    echo "name: $RESOLVED_NAME"
+    echo "type: $RESOLVED_TYPE"
+    if [ -n "$RESOLVED_LOCATION" ]; then
+        echo "location: $RESOLVED_LOCATION"
+    fi
+    if [ -n "$RESOLVED_MAC" ]; then
+        echo "id:   $RESOLVED_MAC"
+    fi
+    echo "hub:  $HUB"
+    echo "port: $PORT"
+    echo "link: $HOW"
+    [ "${CACHED:-}" = "cached" ] && echo "src:  cached (last-known)"
+    if [ -n "$RESOLVED_MAC" ]; then
+        local serial_port
+        serial_port=$(find_serial_port "$RESOLVED_MAC")
+        echo "dev:  ${serial_port:--}"
+    fi
+    if [ -n "$RESOLVED_CHIP" ]; then
+        echo "chip: $RESOLVED_CHIP"
+    fi
+    if [ -n "$RESOLVED_HUB_NAME" ]; then
+        echo "hub_name: $RESOLVED_HUB_NAME"
+    fi
+    # Show type-specific commands if plugin available
+    local type_cmds
+    type_cmds=$(get_type_commands "$RESOLVED_TYPE")
+    [ -n "$type_cmds" ] && echo "cmds: $type_cmds"
+    return 0
+}
+
+# Get commands supported by a device type (from plugin).
+# Returns space-separated list, or empty if no plugin.
+get_type_commands() {
+    local t="$1"
+    load_type_plugin "$t" || true
+    if declare -f "type_${t}_commands" >/dev/null 2>&1; then
+        "type_${t}_commands"
+    fi
+}
+
+cmd_reset() {
+    local force=0
+    # Parse flags before the device name
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            -f|--force) force=1; shift ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+    if [ -n "${1:-}" ]; then
+        resolve_device "$1"
+    elif [ -z "$RESOLVED_NAME" ]; then
+        die "usage: usb-device reset [-f|--force] <name>"
+    fi
+    check_lock_warning "$RESOLVED_NAME"
+    resolve_hub_port
+
+    # ── Step 1: Try port-level power cycle ────────────────────────
+    echo "Resetting '$RESOLVED_NAME' on hub $HUB port $PORT..."
+    sudo uhubctl -a cycle -l "$HUB" -p "$PORT" 2>&1
+
+    # Wait for device to re-enumerate
+    echo "Waiting for device to re-enumerate..."
+    local attempts=0
+    while [ $attempts -lt 10 ]; do
+        sleep 1
+        if device_is_alive "$RESOLVED_MAC"; then
+            echo "Device '$RESOLVED_NAME' is back online."
+            # Update DB with current location
+            local new_result new_serial
+            new_serial=$(find_serial_port "$RESOLVED_MAC")
+            if new_result=$(find_hub_port_live "$RESOLVED_MAC"); then
+                read new_hub new_port new_how <<< "$new_result"
+                db_put "$RESOLVED_NAME" "$RESOLVED_MAC" "$new_hub" "$new_port" "$new_how" "${new_serial:--}"
+            fi
+            return 0
+        fi
+        attempts=$((attempts + 1))
+    done
+
+    echo ""
+    echo "Device did not come back after port-level reset."
+
+    # ── Step 2: Escalate to hub-level power cycle ─────────────────
+    echo "Escalating to hub-level power cycle (hub $HUB)..."
+
+    # Find other known devices on this hub
+    local other_devices
+    other_devices=$(db_devices_on_hub "$HUB" "$PORT")
+
+    if [ -n "$other_devices" ]; then
+        echo ""
+        echo "WARNING: The following devices are also on hub $HUB and will be power-cycled:"
+        while IFS='|' read -r dev_name dev_port; do
+            echo "  - $dev_name (port $dev_port)"
+        done <<< "$other_devices"
+        echo ""
+
+        if [ "$force" -eq 0 ]; then
+            if [ -t 0 ]; then
+                printf "Continue with hub reset? [y/N] "
+                local answer
+                read -r answer
+                case "$answer" in
+                    [yY]|[yY][eE][sS]) ;;
+                    *) echo "Aborted."; exit 1 ;;
+                esac
+            else
+                echo "Non-interactive mode and --force not set. Aborting hub reset."
+                exit 1
+            fi
+        else
+            echo "(--force: proceeding without confirmation)"
+        fi
+    fi
+
+    # Cycle all ports on the hub
+    sudo uhubctl -a cycle -l "$HUB" 2>&1
+
+    echo "Waiting for device to re-enumerate after hub reset..."
+    attempts=0
+    while [ $attempts -lt 15 ]; do
+        sleep 1
+        if device_is_alive "$RESOLVED_MAC"; then
+            echo "Device '$RESOLVED_NAME' is back online."
+            local new_result new_serial
+            new_serial=$(find_serial_port "$RESOLVED_MAC")
+            if new_result=$(find_hub_port_live "$RESOLVED_MAC"); then
+                read new_hub new_port new_how <<< "$new_result"
+                db_put "$RESOLVED_NAME" "$RESOLVED_MAC" "$new_hub" "$new_port" "$new_how" "${new_serial:--}"
+            fi
+            return 0
+        fi
+        attempts=$((attempts + 1))
+    done
+
+    echo "Device '$RESOLVED_NAME' did not come back after hub reset."
+    return 1
+}
+
+cmd_off() {
+    resolve_device "$1"
+    check_lock_warning "$RESOLVED_NAME"
+    resolve_hub_port
+    echo "Powering off '$RESOLVED_NAME' on hub $HUB port $PORT..."
+    sudo uhubctl -a off -l "$HUB" -p "$PORT"
+}
+
+cmd_on() {
+    resolve_device "$1"
+    check_lock_warning "$RESOLVED_NAME"
+    resolve_hub_port
+    echo "Powering on '$RESOLVED_NAME' on hub $HUB port $PORT..."
+    sudo uhubctl -a on -l "$HUB" -p "$PORT"
+}
+
+# Require serial port for the resolved device. Sets RESOLVED_PORT.
+require_serial_port() {
+    [ -n "$RESOLVED_MAC" ] || die "'$RESOLVED_NAME' (type=$RESOLVED_TYPE) has no serial number — no serial port available"
+    RESOLVED_PORT=$(find_serial_port "$RESOLVED_MAC")
+    [ -n "$RESOLVED_PORT" ] || die "no serial port found for '$RESOLVED_NAME' ($RESOLVED_MAC)"
+}
+
+# Dispatch to a type plugin action. Dies with a clear message if no plugin.
+# Usage: dispatch_type_action <action>
+dispatch_type_action() {
+    local action="$1"
+    local func="type_${RESOLVED_TYPE}_${action}"
+    load_type_plugin "$RESOLVED_TYPE" || true
+    if declare -f "$func" >/dev/null 2>&1; then
+        "$func" "$RESOLVED_PORT" "$RESOLVED_NAME"
+    else
+        die "'$RESOLVED_NAME' (type=$RESOLVED_TYPE) — no $action support (no plugin for type=$RESOLVED_TYPE)"
+    fi
+}
+
+cmd_port() {
+    resolve_device "$1"
+    require_serial_port
+    echo "$RESOLVED_PORT"
+}
+
+# ── Type-dispatched commands ───────────────────────────────────────
+
+cmd_type() {
+    resolve_device "$1"
+    echo "$RESOLVED_TYPE"
+}
+
+cmd_bootloader() {
+    resolve_device "$1"
+    check_lock_warning "$RESOLVED_NAME"
+    require_serial_port
+    dispatch_type_action "bootloader"
+}
+
+cmd_boot() {
+    resolve_device "$1"
+    check_lock_warning "$RESOLVED_NAME"
+    require_serial_port
+    dispatch_type_action "boot"
+}
+
+# ── Insight Hub integration ────────────────────────────────────────
+
+cmd_hub() {
+    local subcmd="${1:-status}"
+    shift 2>/dev/null || true
+    parse_config
+
+    local hub_args=()
+    # Pass hub config if set
+    [ -n "$HUB_CONF_PORT" ] && hub_args+=(--hub-port "$HUB_CONF_PORT")
+    [ -n "$HUB_CONF_LOCATION" ] && hub_args+=(--hub-location "$HUB_CONF_LOCATION")
+    # Pass device registry as JSON
+    hub_args+=(--config "$CONF")
+
+    case "$subcmd" in
+        status)    $PYTHON -u "${SCRIPT_DIR}/hub_agent.py" "${hub_args[@]}" --status "$@" ;;
+        sync)      $PYTHON -u "${SCRIPT_DIR}/hub_agent.py" "${hub_args[@]}" --once "$@" ;;
+        watch)     $PYTHON -u "${SCRIPT_DIR}/hub_agent.py" "${hub_args[@]}" "$@" ;;
+        install)   $PYTHON -u "${SCRIPT_DIR}/hub_agent.py" --install ;;
+        uninstall) $PYTHON -u "${SCRIPT_DIR}/hub_agent.py" --uninstall ;;
+        log)       local logfile="$HOME/Library/Logs/hub-agent.log"
+                   [ -f "$logfile" ] && tail -f "$logfile" || echo "No log file: $logfile" ;;
+        *)         die "unknown hub command: $subcmd (try: status, sync, watch, install, uninstall, log)" ;;
+    esac
+}
+
+# ── Main dispatch ─────────────────────────────────────────────────
+
+# Commands that don't take a device name
+case "${1:-}" in
+    list)  cmd_list; exit ;;
+    scan)  cmd_scan; exit ;;
+    check) cmd_check; exit ;;
+    locks) cmd_locks; exit ;;
+    hub)   shift; cmd_hub "$@"; exit ;;
+esac
+
+# Dispatch a single command. If RESOLVED_NAME is already set, use it.
+# Otherwise, the command must provide a device name.
+dispatch_cmd() {
+    local cmd="$1"; shift
+    case "$cmd" in
+        find)       cmd_find "${1:-$RESOLVED_NAME}" ;;
+        type)       cmd_type "${1:-$RESOLVED_NAME}" ;;
+        reset)      cmd_reset "$@" ;;
+        off)        cmd_off "${1:-$RESOLVED_NAME}" ;;
+        on)         cmd_on "${1:-$RESOLVED_NAME}" ;;
+        port)       cmd_port "${1:-$RESOLVED_NAME}" ;;
+        bootloader) cmd_bootloader "${1:-$RESOLVED_NAME}" ;;
+        boot)       cmd_boot "${1:-$RESOLVED_NAME}" ;;
+        checkout)   cmd_checkout "$@" ;;
+        checkin)    cmd_checkin "$@" ;;
+        *)          die "unknown command: $cmd" ;;
+    esac
+}
+
+# Traditional: usb-device <command> <device>
+# Chained:    usb-device <device> <cmd1> [cmd2] ...
+is_command() {
+    case "$1" in
+        find|type|reset|off|on|port|bootloader|boot|checkout|checkin) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if [ -z "${1:-}" ]; then
+    cat <<'USAGE'
+usage: usb-device <command> [options] [device-name]
+       usb-device <device-name> <command> [command ...]
+
+Commands:
+  list                          Show all registered devices and their status
+  scan                          Scan USB bus and update last-known locations
+  check                         Verify all dependencies are installed
+  find <name>                   Show hub, port, serial device info
+  type <name>                   Print device type (for scripting)
+  reset [-f|--force] <name>     Power-cycle a device (escalates to hub if needed)
+  off <name>                    Turn off power to a device
+  on <name>                     Turn on power to a device
+  port <name>                   Print /dev/cu.* path
+  bootloader <name>             Enter bootloader (requires type plugin)
+  boot <name>                   Exit bootloader (requires type plugin)
+  checkout [opts] <name>        Acquire exclusive access to a device
+  checkin [-f] <name>           Release exclusive access
+  locks                         Show all checked-out devices
+  hub status                    Show Insight Hub channels and device assignments
+  hub sync                      One-shot: push device names to hub displays
+  hub watch                     Daemon: continuously update hub on connect/disconnect
+  hub install                   Install hub agent as macOS LaunchAgent (auto-start)
+  hub uninstall                 Remove hub agent LaunchAgent
+  hub log                       Tail the hub agent log file
+
+Checkout options:
+  --wait                        Block until the device is available
+  --timeout N                   Give up after N seconds (with --wait)
+  --owner STR                   Who is checking out (default: user@host)
+  --purpose STR                 Why (shown in locks output)
+  --ttl N                       Auto-expire lock after N seconds (default: 1800)
+
+Chained commands (device name first, then one or more commands):
+  usb-device "1.9" reset bootloader    # power-cycle then enter bootloader
+
+Device names support fuzzy matching (exact, substring, or regex).
+USAGE
+    exit 1
+fi
+
+if is_command "$1"; then
+    # Traditional: usb-device <command> [flags] <device>
+    cmd="$1"; shift
+    case "$cmd" in
+        reset|checkout|checkin) dispatch_cmd "$cmd" "$@" ;;
+        *)
+            [ -n "${1:-}" ] || die "usage: usb-device $cmd <name>"
+            dispatch_cmd "$cmd" "$1"
+            ;;
+    esac
+else
+    # Chained: usb-device <device> <cmd1> [cmd2] ...
+    resolve_device "$1"; shift
+    [ -n "${1:-}" ] || die "usage: usb-device <device> <command> [command ...]"
+    while [ $# -gt 0 ]; do
+        is_command "$1" || die "unknown command: $1"
+        dispatch_cmd "$1"
+        shift
+    done
+fi

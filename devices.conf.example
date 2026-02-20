@@ -1,0 +1,52 @@
+# USB Device Registry
+#
+# Supports two formats: legacy flat and INI-style sections.
+#
+# Legacy flat format (type defaults to 'generic'):
+#   NAME=MAC_ADDRESS
+#
+# INI-style sections:
+#   [Device Name]
+#   mac=MAC_ADDRESS         # or serial= (pyserial serial_number)
+#   type=esp32              # generic (default), esp32, ppk2, power, ...
+#   chip=esp32s3            # optional, passed to type plugin
+#   location=HUB.PORT       # static USB location (for type=power)
+#
+# Type plugins live in types.d/ (shipped) or ~/.config/usb-devices/types.d/ (user).
+# Each type can add commands like bootloader/boot. See types.d/esp32.sh for an example.
+#
+# To find a device's serial number:
+#   pio device list --json-output
+# Look for the SER= field in the hwid.
+#
+# Examples:
+
+# Flat format (backward compatible, type=generic):
+# MPCB 1.9 Development=B8:F8:62:D2:2A:FC
+
+# ESP32 board with explicit type, chip, and Insight Hub display name:
+# [MPCB 1.9 Development]
+# mac=B8:F8:62:D2:2A:FC
+# type=esp32
+# chip=esp32s3
+# hub_name=1.9 Dev          # optional, max 14 chars, shown on Insight Hub display
+
+# PPK2 power profiler (Nordic serial number):
+# [PPK2 Dev]
+# serial=C9F6358AC307
+# type=ppk2
+
+# Dumb USB power port (magnetic charger, no serial identity):
+# [Charger Port A]
+# location=20-2.3
+# type=power
+
+# ── USB Insight Hub ──────────────────────────────────────────────
+#
+# Optional: configure the Insight Hub for display integration.
+# Auto-detected if connected (product="InsightHUB Controller").
+# Manual config overrides auto-detection.
+#
+# [hub:insight]
+# port=/dev/cu.usbmodemXXXX    # CDC serial port for the hub's ESP32
+# location=20-3.3              # uhubctl hub ID (ports 1-3 = CH1-CH3)
