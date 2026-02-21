@@ -47,9 +47,10 @@ SERIAL_MONITOR="$SCRIPT_DIR/serial-monitor"
 
 # ── Python / pyserial availability ───────────────────────────────
 
-@test "PlatformIO python exists and has pyserial" {
+@test "PlatformIO venv python exists and has pyserial" {
+    # Only tests the PIO venv path — skipped in CI where pip install is used instead
     PIO_PYTHON="$HOME/.platformio/penv/bin/python3"
-    [ -x "$PIO_PYTHON" ]
+    [ -x "$PIO_PYTHON" ] || skip "PlatformIO venv not present"
     run "$PIO_PYTHON" -c "from serial.tools.list_ports import comports; comports()"
     [ "$status" -eq 0 ]
 }
