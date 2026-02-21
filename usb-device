@@ -35,13 +35,6 @@
 CONF="${USB_DEVICE_CONF:-$HOME/.config/usb-devices/devices.conf}"
 DB="${USB_DEVICE_DB:-$HOME/.config/usb-devices/locations.json}"
 
-# Use PlatformIO venv python (has pyserial), fall back to system python3
-if [ -x "$HOME/.platformio/penv/bin/python3" ]; then
-    PYTHON="$HOME/.platformio/penv/bin/python3"
-else
-    PYTHON="python3"
-fi
-
 die() { echo "error: $*" >&2; exit 1; }
 
 # Globals set by resolve_device()
@@ -60,6 +53,15 @@ _self="$0"
 [ -L "$_self" ] && _self="$(readlink "$_self")"
 SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 unset _self
+
+# Python with pyserial: env override → venv → system
+if [ -n "${USB_DEVICE_PYTHON:-}" ]; then
+    PYTHON="$USB_DEVICE_PYTHON"
+elif [ -x "$SCRIPT_DIR/.venv/bin/python3" ]; then
+    PYTHON="$SCRIPT_DIR/.venv/bin/python3"
+else
+    PYTHON="python3"
+fi
 
 USB_DEVICE_VERSION="$(cat "${SCRIPT_DIR}/VERSION" 2>/dev/null || echo "dev")"
 TYPE_PLUGIN_DIRS=(

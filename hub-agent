@@ -20,10 +20,10 @@ _self="$0"
 SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 unset _self
 
-# Use PlatformIO venv python (has pyserial), fall back to system python3
-PIO_PYTHON="${HOME}/.platformio/penv/bin/python3"
-if [ ! -x "$PIO_PYTHON" ]; then
-    PIO_PYTHON="python3"
+# Use venv python (has pyserial), fall back to system python3
+PYTHON="${SCRIPT_DIR}/.venv/bin/python3"
+if [ ! -x "$PYTHON" ]; then
+    PYTHON="python3"
 fi
 
-exec "$PIO_PYTHON" -u "${SCRIPT_DIR}/hub_agent.py" "$@"
+exec "$PYTHON" -u "${SCRIPT_DIR}/hub_agent.py" "$@"

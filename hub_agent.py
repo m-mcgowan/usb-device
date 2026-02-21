@@ -464,7 +464,7 @@ def install_launchd():
     # Resolve paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.expanduser("~/.config/usb-devices/devices.conf")
-    python_path = os.path.expanduser("~/.platformio/penv/bin/python3")
+    python_path = os.path.join(script_dir, ".venv", "bin", "python3")
     if not os.path.isfile(python_path):
         python_path = sys.executable
 

@@ -43,10 +43,17 @@ fi
 mkdir -p "$INSTALL_DIR"
 cp "$TMP"/usb-device "$TMP"/serial-monitor "$TMP"/hub-agent "$INSTALL_DIR/"
 cp "$TMP"/hub_agent.py "$TMP"/serial_monitor.py "$TMP"/iokit_usb.py "$INSTALL_DIR/"
-cp "$TMP"/VERSION "$TMP"/devices.conf.example "$INSTALL_DIR/"
+cp "$TMP"/VERSION "$TMP"/devices.conf.example "$TMP"/requirements.txt "$INSTALL_DIR/"
 mkdir -p "$INSTALL_DIR/types.d"
 cp "$TMP"/types.d/*.sh "$INSTALL_DIR/types.d/"
 chmod +x "$INSTALL_DIR"/{usb-device,serial-monitor,hub-agent}
+
+# Create Python venv with pyserial
+if [ ! -f "$INSTALL_DIR/.venv/bin/python3" ]; then
+    echo "Creating Python venv..."
+    python3 -m venv "$INSTALL_DIR/.venv"
+fi
+"$INSTALL_DIR/.venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
 
 # Create user config directory
 CONFIG_DIR="$HOME/.config/usb-devices"
@@ -80,10 +87,10 @@ for dep in uhubctl jq; do
         missing=$((missing + 1))
     fi
 done
-if python3 -c "import serial" &>/dev/null 2>&1; then
-    echo "  [ok] pyserial"
+if [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+    echo "  [ok] pyserial (venv)"
 else
-    echo "  [missing] pyserial — run: pip3 install pyserial"
+    echo "  [missing] pyserial venv — re-run installer"
     missing=$((missing + 1))
 fi
 

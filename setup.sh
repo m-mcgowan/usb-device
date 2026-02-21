@@ -38,17 +38,13 @@ if [ "$QUICK" -eq 0 ]; then
         echo "[ok] uhubctl installed: $(which uhubctl)"
     fi
 
-    # pyserial (check PIO venv first, then system)
-    PIO_PYTHON="${HOME}/.platformio/penv/bin/python3"
-    if [ -x "$PIO_PYTHON" ] && "$PIO_PYTHON" -c "import serial" &>/dev/null; then
-        echo "[ok] pyserial available in PlatformIO venv"
-    elif python3 -c "import serial" &>/dev/null; then
-        echo "[ok] pyserial available in system python"
-    else
-        echo "[installing] pyserial via pip..."
-        pip3 install pyserial
-        echo "[ok] pyserial installed"
+    # Python venv with pyserial
+    if [ ! -f "$SCRIPT_DIR/.venv/bin/python3" ]; then
+        echo "[creating] Python venv..."
+        python3 -m venv "$SCRIPT_DIR/.venv"
     fi
+    "$SCRIPT_DIR/.venv/bin/pip" install -q -r "$SCRIPT_DIR/requirements.txt"
+    echo "[ok] pyserial installed in .venv"
 
     # jq (needed for locations.json DB)
     if command -v jq &>/dev/null; then
@@ -198,7 +194,7 @@ if [ "$QUICK" -eq 0 ] && [ "$(uname)" = "Darwin" ]; then
         echo ""
         read -r -p "Install hub-agent LaunchAgent? [y/N] " response
         if [[ "$response" =~ ^[Yy] ]]; then
-            "$PIO_PYTHON" -u "$SCRIPT_DIR/hub_agent.py" --install
+            "$SCRIPT_DIR/.venv/bin/python3" -u "$SCRIPT_DIR/hub_agent.py" --install
         else
             echo "[skip] hub-agent LaunchAgent (install later: usb-device hub install)"
         fi

@@ -65,13 +65,10 @@ fi
 MOCK
     chmod +x "$MOCK_BIN/python3"
 
-    # Also mock the PIO python path so PYTHON resolves to our mock
-    mkdir -p "$TEST_DIR/.platformio/penv/bin"
-    cp "$MOCK_BIN/python3" "$TEST_DIR/.platformio/penv/bin/python3"
-
     # Export env vars
     export USB_DEVICE_CONF="$CONF"
     export USB_DEVICE_DB="$DB"
+    export USB_DEVICE_PYTHON="$MOCK_BIN/python3"
     export PATH="$MOCK_BIN:$PATH"
     export HOME="$TEST_DIR"
 }

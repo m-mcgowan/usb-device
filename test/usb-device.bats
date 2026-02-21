@@ -47,21 +47,10 @@ SERIAL_MONITOR="$SCRIPT_DIR/serial-monitor"
 
 # ── Python / pyserial availability ───────────────────────────────
 
-@test "PlatformIO venv python exists and has pyserial" {
-    # Only tests the PIO venv path — skipped in CI where pip install is used instead
-    PIO_PYTHON="$HOME/.platformio/penv/bin/python3"
-    [ -x "$PIO_PYTHON" ] || skip "PlatformIO venv not present"
-    run "$PIO_PYTHON" -c "from serial.tools.list_ports import comports; comports()"
-    [ "$status" -eq 0 ]
-}
-
-@test "usb-device resolves PYTHON to a working interpreter with pyserial" {
-    # Source just the PYTHON resolution from the script
-    if [ -x "$HOME/.platformio/penv/bin/python3" ]; then
-        PYTHON="$HOME/.platformio/penv/bin/python3"
-    else
-        PYTHON="python3"
-    fi
+@test "venv python exists and has pyserial" {
+    SCRIPT_DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
+    PYTHON="$SCRIPT_DIR/.venv/bin/python3"
+    [ -x "$PYTHON" ] || skip ".venv not present (run setup.sh first)"
     run "$PYTHON" -c "from serial.tools.list_ports import comports; print('ok')"
     [ "$status" -eq 0 ]
     [[ "$output" == *"ok"* ]]
