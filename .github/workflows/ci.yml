@@ -46,7 +46,7 @@ jobs:
           key: brew-test-${{ runner.os }}
 
       - name: Install system dependencies
-        run: brew install bats-core jq uhubctl
+        run: brew install bats-core jq uhubctl 2>/dev/null
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
