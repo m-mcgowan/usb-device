@@ -34,9 +34,10 @@ jobs:
       - name: Update formula
         run: |
           cd homebrew-tap
-          sed -i "s|url \".*\"|url \"${{ steps.release.outputs.tarball_url }}\"|" Formula/usb-device.rb
-          sed -i "s|sha256 \".*\"|sha256 \"${{ steps.sha.outputs.sha256 }}\"|" Formula/usb-device.rb
-          sed -i "s|version \".*\"|version \"${{ steps.release.outputs.version }}\"|" Formula/usb-device.rb
+          # Only update the top-level url/sha256/version (lines before 'depends_on')
+          sed -i '0,/^  url /{s|^  url ".*"|  url "${{ steps.release.outputs.tarball_url }}"|;}' Formula/usb-device.rb
+          sed -i '0,/^  sha256 /{s|^  sha256 ".*"|  sha256 "${{ steps.sha.outputs.sha256 }}"|;}' Formula/usb-device.rb
+          sed -i 's|^  version ".*"|  version "${{ steps.release.outputs.version }}"|' Formula/usb-device.rb
 
       - name: Commit and push
         run: |
