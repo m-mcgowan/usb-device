@@ -560,6 +560,46 @@ _show_lock_holder() {
     [ -n "$ttl" ] && [ "$ttl" -gt 0 ] 2>/dev/null && echo "  ttl:     ${ttl}s" >&2
 }
 
+# Acquire a single device lock. Internal — called by cmd_checkout.
+# Returns 0 on success, 1 on failure.
+_checkout_one() {
+    local name="$1" owner="$2" purpose="$3" ttl="$4" wait="$5" deadline="$6"
+
+    resolve_device "$name"
+    local lock_path
+    lock_path=$(_lock_path "$RESOLVED_NAME")
+
+    while true; do
+        _try_reclaim_lock "$lock_path"
+
+        if mkdir "$lock_path" 2>/dev/null; then
+            cat > "$lock_path/info" <<EOF
+PID=$$
+OWNER=$owner
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=$purpose
+TTL=$ttl
+EOF
+            echo "Checked out '$RESOLVED_NAME'" >&2
+            return 0
+        fi
+
+        if [ "$wait" -eq 0 ]; then
+            echo "Device '$RESOLVED_NAME' is checked out:" >&2
+            _show_lock_holder "$lock_path"
+            return 1
+        fi
+
+        if [ "$deadline" -gt 0 ] && [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "Timed out waiting for '$RESOLVED_NAME' (${deadline}s):" >&2
+            _show_lock_holder "$lock_path"
+            return 1
+        fi
+
+        sleep 5
+    done
+}
+
 cmd_checkout() {
     local wait=0 timeout=0 owner="" purpose="" ttl="1800"
 
@@ -573,64 +613,43 @@ cmd_checkout() {
             *)         die "unknown flag: $1" ;;
         esac
     done
-    [ -n "${1:-}" ] || die "usage: usb-device checkout [--wait] [--timeout N] [--owner STR] [--purpose STR] [--ttl N] <name>"
+    [ -n "${1:-}" ] || die "usage: usb-device checkout [--wait] [--timeout N] [--owner STR] [--purpose STR] [--ttl N] <name> [name ...]"
 
-    resolve_device "$1"
     mkdir -p "$LOCK_DIR"
-
-    local lock_path
-    lock_path=$(_lock_path "$RESOLVED_NAME")
     [ -n "$owner" ] || owner="$(whoami)@$(hostname -s)"
 
     local deadline=0
     [ "$wait" -eq 1 ] && [ "$timeout" -gt 0 ] && deadline=$(( $(date +%s) + timeout ))
 
-    while true; do
-        # Try to reclaim stale lock
-        _try_reclaim_lock "$lock_path"
+    # Sort device names for deterministic acquisition order (prevents deadlock)
+    local sorted_names=()
+    while IFS= read -r n; do
+        sorted_names+=("$n")
+    done < <(printf '%s\n' "$@" | sort -f)
 
-        # Atomic acquire
-        if mkdir "$lock_path" 2>/dev/null; then
-            cat > "$lock_path/info" <<EOF
-PID=$$
-OWNER=$owner
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-PURPOSE=$purpose
-TTL=$ttl
-EOF
-            echo "Checked out '$RESOLVED_NAME'" >&2
-            return 0
-        fi
-
-        # Lock held — wait or fail
-        if [ "$wait" -eq 0 ]; then
-            echo "Device '$RESOLVED_NAME' is checked out:" >&2
-            _show_lock_holder "$lock_path"
+    # Acquire all locks in sorted order; rollback on failure
+    local acquired=()
+    for name in "${sorted_names[@]}"; do
+        if _checkout_one "$name" "$owner" "$purpose" "$ttl" "$wait" "$deadline"; then
+            acquired+=("$RESOLVED_NAME")
+        else
+            # Rollback: release all already-acquired locks
+            for held in "${acquired[@]}"; do
+                local lp
+                lp=$(_lock_path "$held")
+                rm -rf "$lp"
+                echo "Rolled back '$held'" >&2
+            done
             return 1
         fi
-
-        if [ "$deadline" -gt 0 ] && [ "$(date +%s)" -ge "$deadline" ]; then
-            echo "Timed out waiting for '$RESOLVED_NAME' (${timeout}s):" >&2
-            _show_lock_holder "$lock_path"
-            return 1
-        fi
-
-        # Poll every 5 seconds
-        sleep 5
     done
 }
 
-cmd_checkin() {
-    local force=0
-    while [[ "${1:-}" == -* ]]; do
-        case "$1" in
-            -f|--force) force=1; shift ;;
-            *)          die "unknown flag: $1" ;;
-        esac
-    done
-    [ -n "${1:-}" ] || die "usage: usb-device checkin [-f|--force] <name>"
+# Release a single device lock. Internal — called by cmd_checkin.
+_checkin_one() {
+    local name="$1" force="$2"
 
-    resolve_device "$1"
+    resolve_device "$name"
 
     local lock_path
     lock_path=$(_lock_path "$RESOLVED_NAME")
@@ -640,12 +659,10 @@ cmd_checkin() {
         return 0
     fi
 
-    # Only the owner PID can release (unless forced or PID dead)
     if [ "$force" -eq 0 ]; then
         local lock_pid
         lock_pid=$(_lock_field "$lock_path" "PID")
         if [ -n "$lock_pid" ] && [ "$lock_pid" != "$$" ]; then
-            # Check if the owning process is still alive
             local pid_alive=0
             if kill -0 "$lock_pid" 2>/dev/null; then
                 pid_alive=1
@@ -664,6 +681,23 @@ cmd_checkin() {
     rm -rf "$lock_path"
     echo "Checked in '$RESOLVED_NAME'" >&2
     return 0
+}
+
+cmd_checkin() {
+    local force=0
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            -f|--force) force=1; shift ;;
+            *)          die "unknown flag: $1" ;;
+        esac
+    done
+    [ -n "${1:-}" ] || die "usage: usb-device checkin [-f|--force] <name> [name ...]"
+
+    local failed=0
+    for name in "$@"; do
+        _checkin_one "$name" "$force" || failed=1
+    done
+    return "$failed"
 }
 
 cmd_locks() {
@@ -1233,8 +1267,8 @@ Commands:
   port <name>                   Print /dev/cu.* path
   bootloader <name>             Enter bootloader (requires type plugin)
   boot <name>                   Exit bootloader (requires type plugin)
-  checkout [opts] <name>        Acquire exclusive access to a device
-  checkin [-f] <name>           Release exclusive access
+  checkout [opts] <name> [...]   Acquire exclusive access (multi-device: sorted, all-or-nothing)
+  checkin [-f] <name> [...]     Release exclusive access
   locks                         Show all checked-out devices
   hub status                    Show Insight Hub channels and device assignments
   hub sync                      One-shot: push device names to hub displays

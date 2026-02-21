@@ -775,6 +775,59 @@ EOF
     [ "$status" -eq 0 ]
 }
 
+@test "checkout: multi-device acquires all in sorted order" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    run "$USB_DEVICE" checkout "Device C" "Device A" "Device B"
+    [ "$status" -eq 0 ]
+    # All three locked
+    [ -d "$TEST_DIR/locks/device_a" ]
+    [ -d "$TEST_DIR/locks/device_b" ]
+    [ -d "$TEST_DIR/locks/device_c" ]
+    # Output order should be sorted (A, B, C)
+    [[ "$output" == *"Checked out 'Device A'"* ]]
+    [[ "$output" == *"Checked out 'Device B'"* ]]
+    [[ "$output" == *"Checked out 'Device C'"* ]]
+}
+
+@test "checkout: multi-device rolls back on failure" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Pre-lock Device B with a live PID
+    mkdir -p "$TEST_DIR/locks/device_b"
+    cat > "$TEST_DIR/locks/device_b/info" <<EOF
+PID=$PPID
+OWNER=blocker
+TIMESTAMP=2026-02-19T10:00:00Z
+PURPOSE=blocking
+TTL=999999
+EOF
+
+    run "$USB_DEVICE" checkout "Device C" "Device A" "Device B"
+    [ "$status" -eq 1 ]
+    # Device A was acquired first (sorted) then rolled back
+    [[ "$output" == *"Rolled back 'Device A'"* ]]
+    # No locks should remain from our attempt
+    [ ! -d "$TEST_DIR/locks/device_a" ]
+    [ ! -d "$TEST_DIR/locks/device_c" ]
+    # Blocker's lock still intact
+    [ -d "$TEST_DIR/locks/device_b" ]
+}
+
+@test "checkin: multi-device releases all" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Checkout two devices
+    "$USB_DEVICE" checkout "Device A" "Device B"
+
+    run "$USB_DEVICE" checkin "Device A" "Device B"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Checked in 'Device A'"* ]]
+    [[ "$output" == *"Checked in 'Device B'"* ]]
+    [ ! -d "$TEST_DIR/locks/device_a" ]
+    [ ! -d "$TEST_DIR/locks/device_b" ]
+}
+
 @test "INI: hub_name= shown in find output" {
     cat > "$CONF" << 'EOF'
 [MPCB 1.9 Dev]
