@@ -66,6 +66,7 @@ MOCK
     chmod +x "$MOCK_BIN/python3"
 
     # Export env vars
+    export USB_DEVICE_CONFIG_DIR="$TEST_DIR"
     export USB_DEVICE_CONF="$CONF"
     export USB_DEVICE_DB="$DB"
     export USB_DEVICE_PYTHON="$MOCK_BIN/python3"
@@ -554,8 +555,8 @@ type_testboard2_bootloader() { echo "SHIPPED"; }
 PLUGIN
 
     # Create user plugin that shadows it
-    mkdir -p "$HOME/.config/usb-devices/types.d"
-    cat > "$HOME/.config/usb-devices/types.d/testboard2.sh" << 'PLUGIN'
+    mkdir -p "$TEST_DIR/types.d"
+    cat > "$TEST_DIR/types.d/testboard2.sh" << 'PLUGIN'
 type_testboard2_bootloader() { echo "USER_OVERRIDE"; }
 PLUGIN
 

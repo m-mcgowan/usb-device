@@ -18,7 +18,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR" && git rev-parse --show-toplevel 2>/dev/null || echo "$SCRIPT_DIR")"
-CONFIG_DIR="$HOME/.config/usb-devices"
+CONFIG_DIR="${USB_DEVICE_CONFIG_DIR:-$HOME/.config/usb-devices}"
 QUICK=0
 
 [ "${1:-}" = "--quick" ] && QUICK=1

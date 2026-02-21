@@ -56,7 +56,7 @@ fi
 "$INSTALL_DIR/.venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
 
 # Create user config directory
-CONFIG_DIR="$HOME/.config/usb-devices"
+CONFIG_DIR="${USB_DEVICE_CONFIG_DIR:-$HOME/.config/usb-devices}"
 mkdir -p "$CONFIG_DIR"
 if [ ! -f "$CONFIG_DIR/devices.conf" ]; then
     cp "$INSTALL_DIR/devices.conf.example" "$CONFIG_DIR/devices.conf"

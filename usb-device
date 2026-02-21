@@ -32,8 +32,9 @@
 #   - Multiple matches: interactive selection prompt
 #   - No matches: shows list of known devices
 
-CONF="${USB_DEVICE_CONF:-$HOME/.config/usb-devices/devices.conf}"
-DB="${USB_DEVICE_DB:-$HOME/.config/usb-devices/locations.json}"
+CONFIG_DIR="${USB_DEVICE_CONFIG_DIR:-$HOME/.config/usb-devices}"
+CONF="${USB_DEVICE_CONF:-$CONFIG_DIR/devices.conf}"
+DB="${USB_DEVICE_DB:-$CONFIG_DIR/locations.json}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -66,7 +67,7 @@ fi
 USB_DEVICE_VERSION="$(cat "${SCRIPT_DIR}/VERSION" 2>/dev/null || echo "dev")"
 TYPE_PLUGIN_DIRS=(
     "${SCRIPT_DIR}/types.d"
-    "${HOME}/.config/usb-devices/types.d"
+    "${CONFIG_DIR}/types.d"
 )
 
 # Source a type plugin. Returns 0 if found, 1 if not.

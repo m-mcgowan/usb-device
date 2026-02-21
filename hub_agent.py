@@ -463,7 +463,8 @@ def install_launchd():
 
     # Resolve paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.expanduser("~/.config/usb-devices/devices.conf")
+    config_dir = os.environ.get("USB_DEVICE_CONFIG_DIR", os.path.expanduser("~/.config/usb-devices"))
+    config_path = os.path.join(config_dir, "devices.conf")
     python_path = os.path.join(script_dir, ".venv", "bin", "python3")
     if not os.path.isfile(python_path):
         python_path = sys.executable
@@ -513,7 +514,8 @@ def uninstall_launchd():
 
 def main():
     parser = argparse.ArgumentParser(description="USB Insight Hub display agent")
-    parser.add_argument("--config", default=os.path.expanduser("~/.config/usb-devices/devices.conf"),
+    default_config_dir = os.environ.get("USB_DEVICE_CONFIG_DIR", os.path.expanduser("~/.config/usb-devices"))
+    parser.add_argument("--config", default=os.path.join(default_config_dir, "devices.conf"),
                         help="Path to devices.conf")
     parser.add_argument("--hub-port", default=None,
                         help="Override: CDC serial port for Insight Hub")
