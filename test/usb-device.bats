@@ -165,16 +165,10 @@ SERIAL_MONITOR="$SCRIPT_DIR/serial-monitor"
     [ "$status" -ne 0 ]
 }
 
-# ── Hook script ──────────────────────────────────────────────────
+# ── Version ──────────────────────────────────────────────────────
 
-@test "post-merge hook script is executable" {
-    REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-    [ -x "$REPO_ROOT/scripts/post-merge" ]
-}
-
-@test "post-merge hook exits cleanly when no changes" {
-    REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-    # Without ORIG_HEAD (not in a real merge), git diff-tree fails silently
-    run bash "$REPO_ROOT/scripts/post-merge"
+@test "usb-device version prints a version string" {
+    run "$USB_DEVICE" version
     [ "$status" -eq 0 ]
+    [[ "$output" =~ ^usb-device\ [0-9]+\.[0-9]+\.[0-9] ]]
 }

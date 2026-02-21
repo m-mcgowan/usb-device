@@ -1,17 +1,57 @@
-# USB Device Management
+# usb-device
 
-Scripts for managing named USB devices: power cycling, serial monitoring, bootloader entry, and persistent device tracking across reconnects and sleep cycles.
+A CLI tool for managing named USB devices on macOS. Give your dev boards friendly names, then power-cycle, reset, flash, and monitor them without hunting for port paths or remembering uhubctl incantations.
 
-Board-specific commands (bootloader, boot) are provided by type plugins — the core is board-agnostic.
+## Why
 
-## Quick Start
+If you work with multiple USB dev boards, you know the pain:
+
+- **Ports change** every time you unplug and replug, or the board wakes from sleep
+- **Power cycling** requires knowing the right uhubctl hub ID, port number, and flags
+- **Bootloader entry** varies by board family (esptool, nrfutil, etc.)
+- **Which board is on which port?** Especially with identical-looking boards, you're guessing
+- **CI needs exclusive access** but there's no coordination mechanism for shared hardware
+
+`usb-device` solves all of this. Register your boards once by name, and everything just works — even after reconnects, sleep cycles, and hub topology changes.
+
+## Features
+
+- **Named devices** — fuzzy matching so `"1.9"` finds `"MPCB 1.9 Development"`
+- **Persistent tracking** — `scan` remembers where devices were, so commands work even when boards are sleeping or disconnected
+- **Power control** — `reset`, `on`, `off` with automatic port-to-hub escalation
+- **Type plugins** — board-specific commands (bootloader, boot) via extensible shell plugins
+- **Serial monitoring** — interactive and non-interactive, with device reset, delayed send, and timestamps
+- **Device locking** — `checkout`/`checkin` for CI jobs with TTL, wait, and stale lock recovery
+- **[USB Insight Hub](https://www.crowdsupply.com/aerio-solutions/usb-insight-hub) integration** — auto-updates per-port displays with device names and connection status, driven by IOKit USB events
+
+## Install
+
+### Homebrew (recommended)
 
 ```bash
-# First-time setup (installs deps, configures PATH, installs git hooks)
-scripts/usb-devices/setup.sh
+brew install m-mcgowan/tap/usb-device
+```
 
-# Register your devices (MAC from pyserial serial_number / pio device list)
+### Script
+
+```bash
+curl -sSL https://raw.githubusercontent.com/m-mcgowan/usb-device/main/install.sh | bash
+```
+
+### Clone
+
+```bash
+git clone https://github.com/m-mcgowan/usb-device.git
+cd usb-device
+./setup.sh
+```
+
+After installing, register your devices:
+
+```bash
 nano ~/.config/usb-devices/devices.conf
+usb-device scan
+usb-device list
 ```
 
 ## usb-device
@@ -34,6 +74,7 @@ usb-device boot "1.9"              # exit bootloader (requires type plugin)
 usb-device checkout "1.9"          # acquire exclusive access
 usb-device checkin "1.9"           # release exclusive access
 usb-device locks                   # show all checked-out devices
+usb-device version                 # print version
 ```
 
 ### Chained commands
@@ -99,7 +140,7 @@ Install as a LaunchAgent to keep displays updated automatically:
 usb-device hub install             # installs and starts immediately
 ```
 
-The agent auto-detects the hub, reconnects if it's unplugged and replugged, and waits patiently if the hub isn't connected yet. Logs go to `~/Library/Logs/hub-agent.log`. The `setup.sh` script offers to install this during first-time setup.
+The agent auto-detects the hub, reconnects if it's unplugged and replugged, and waits patiently if the hub isn't connected yet. Logs go to `~/Library/Logs/hub-agent.log`.
 
 #### Display names
 
@@ -171,27 +212,27 @@ Send data to the serial port after connecting. Use `\n` for newline. Prefix with
 
 Multiple `--send` flags are processed sequentially, delays are relative to the previous send.
 
-## Setup
+## Configuration
 
 ### Dependencies
 
 | Tool | Purpose | Install |
 |------|---------|---------|
 | uhubctl | USB hub port power control | `brew install uhubctl` |
-| pyserial | Serial port enumeration | Included in PlatformIO venv |
+| pyserial | Serial port enumeration | `pip3 install pyserial` |
 | jq | JSON processing for location DB | `brew install jq` |
 
 Type-specific dependencies (e.g. esptool for ESP32) are checked by `usb-device check` based on registered device types.
 
-### Configuration
+### Config files
 
-User config lives outside the repo:
+User config lives in `~/.config/usb-devices/`:
 
 | File | Purpose |
 |------|---------|
-| `~/.config/usb-devices/devices.conf` | Device registry |
-| `~/.config/usb-devices/locations.json` | Last-known hub/port locations (auto-updated by scan) |
-| `~/.config/usb-devices/types.d/` | Custom type plugins (override or extend shipped plugins) |
+| `devices.conf` | Device registry |
+| `locations.json` | Last-known hub/port locations (auto-updated by scan) |
+| `types.d/` | Custom type plugins (override or extend shipped plugins) |
 
 ### Device registration
 
@@ -257,7 +298,7 @@ Type plugins add board-specific commands (bootloader, boot, etc.) to the core to
 
 Plugins are discovered in order (first match wins):
 
-1. `<script-dir>/types.d/<type>.sh` — shipped with the tool
+1. `<install-dir>/types.d/<type>.sh` — shipped with the tool
 2. `~/.config/usb-devices/types.d/<type>.sh` — user overrides
 
 ### Writing a plugin
@@ -299,28 +340,17 @@ type_myboard_boot() {
 
 Only define the functions your type supports. Missing functions = command not available for that type.
 
-### Git hooks
-
-`setup.sh` installs post-merge, post-checkout, and post-rewrite hooks that automatically re-run setup when these scripts change. Uses checksum-based dedup to avoid redundant runs.
-
-## Future Improvements
-
-- **`usb-device pio upload/test/monitor`** — PlatformIO wrappers that accept friendly device names instead of port paths. Auto-detect app name from the project directory or ELF file being uploaded, and push it to the Insight Hub display.
-- **Serial identity protocol** — lightweight probe over serial (e.g. send `\x01`, firmware responds with `{"app":"simple_publish","ver":"1.2.3"}`). Hub agent probes on connect and displays app name + version. Implemented as a shared library across firmware projects.
-- **Insight Hub official agent** — adopt the official macOS Enumeration Extraction Agent when available, or customize the open-source hub firmware (CC BY-SA 4.0) for deeper integration.
-- **Device state detection** — detect sleep and power-off states for display on the hub (bootloader detection is already implemented via ESP32 SYNC probe).
-
 ## Tests
 
 ```bash
 # All tests
-bats scripts/usb-devices/test/
+bats test/
 
 # Basic tests (real environment)
-bats scripts/usb-devices/test/usb-device.bats
+bats test/usb-device.bats
 
 # Mock tests (simulated devices, no hardware needed)
-bats scripts/usb-devices/test/usb-device-mock.bats
+bats test/usb-device-mock.bats
 ```
 
 Requires [bats-core](https://github.com/bats-core/bats-core): `brew install bats-core`
@@ -328,3 +358,7 @@ Requires [bats-core](https://github.com/bats-core/bats-core): `brew install bats
 ## Design
 
 See [DESIGN.md](DESIGN.md) for technical details: event loop, IOKit bridge, channel mapping, bootloader detection, type plugin system, and file layout.
+
+## License
+
+[MIT](LICENSE)

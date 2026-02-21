@@ -13,13 +13,15 @@
 #   serial-monitor "1.9" --reset          # reset device before monitoring
 #   serial-monitor "1.9" --send T --timeout 10  # send 'T' then capture 10s
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PIO_PYTHON="${HOME}/.platformio/penv/bin/python3"
+_self="$0"
+[ -L "$_self" ] && _self="$(readlink "$_self")"
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+unset _self
 
+# Use PlatformIO venv python (has pyserial), fall back to system python3
+PIO_PYTHON="${HOME}/.platformio/penv/bin/python3"
 if [ ! -x "$PIO_PYTHON" ]; then
-    echo "error: PlatformIO python not found at $PIO_PYTHON" >&2
-    echo "Install PlatformIO or set PIO_PYTHON to the correct path." >&2
-    exit 1
+    PIO_PYTHON="python3"
 fi
 
 # Resolve device type if the first arg looks like a device name (not a port or flag)

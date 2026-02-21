@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Homebrew packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            /usr/local/Cellar/shellcheck
+          key: brew-lint-shellcheck-${{ runner.os }}
+
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      - name: Lint shell scripts
+        run: shellcheck usb-device serial-monitor hub-agent setup.sh install.sh types.d/*.sh
+
+  test:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Homebrew packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            /usr/local/Cellar/bats-core
+            /usr/local/Cellar/jq
+            /usr/local/Cellar/uhubctl
+          key: brew-test-${{ runner.os }}
+
+      - name: Install system dependencies
+        run: |
+          brew install bats-core jq uhubctl
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install pyserial
+
+      - name: Run mock tests
+        run: bats test/usb-device-mock.bats
+
+      - name: Run basic tests
+        run: bats test/usb-device.bats

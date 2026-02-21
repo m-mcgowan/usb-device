@@ -1,0 +1,49 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-homebrew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get release info
+        id: release
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          TARBALL_URL="https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.event.release.tag_name }}.tar.gz"
+          echo "tarball_url=$TARBALL_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Download tarball and compute sha256
+        id: sha
+        run: |
+          curl -sSL "${{ steps.release.outputs.tarball_url }}" -o release.tar.gz
+          SHA=$(shasum -a 256 release.tar.gz | awk '{print $1}')
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: m-mcgowan/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        run: |
+          cd homebrew-tap
+          sed -i "s|url \".*\"|url \"${{ steps.release.outputs.tarball_url }}\"|" Formula/usb-device.rb
+          sed -i "s|sha256 \".*\"|sha256 \"${{ steps.sha.outputs.sha256 }}\"|" Formula/usb-device.rb
+          sed -i "s|version \".*\"|version \"${{ steps.release.outputs.version }}\"|" Formula/usb-device.rb
+
+      - name: Commit and push
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/usb-device.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "usb-device ${{ steps.release.outputs.version }}"
+          git push

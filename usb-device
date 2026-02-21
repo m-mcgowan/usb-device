@@ -54,7 +54,14 @@ RESOLVED_HUB_NAME=""
 
 # ── Type plugin loading ────────────────────────────────────────────
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve symlinks so SCRIPT_DIR points to the real install location
+# (needed for Homebrew which symlinks bin/ → libexec/)
+_self="$0"
+[ -L "$_self" ] && _self="$(readlink "$_self")"
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+unset _self
+
+USB_DEVICE_VERSION="$(cat "${SCRIPT_DIR}/VERSION" 2>/dev/null || echo "dev")"
 TYPE_PLUGIN_DIRS=(
     "${SCRIPT_DIR}/types.d"
     "${HOME}/.config/usb-devices/types.d"
@@ -357,7 +364,9 @@ for p in comports():
     local -a known_hubs=()
     while IFS= read -r line; do
         if [[ "$line" =~ "hub " ]]; then
-            known_hubs+=($(echo "$line" | sed -E 's/.*hub ([^ ,]+).*/\1/'))
+            local hub_id
+            hub_id=$(echo "$line" | sed -E 's/.*hub ([^ ,]+).*/\1/')
+            known_hubs+=("$hub_id")
         fi
     done < <(uhubctl 2>/dev/null)
 
@@ -366,7 +375,7 @@ for p in comports():
     local best_hub="" best_port=""
     for h in "${known_hubs[@]}"; do
         if [[ "$location" == "$h."* ]]; then
-            local remainder="${location#$h.}"
+            local remainder="${location#"$h".}"
             local first_port="${remainder%%.*}"
             if [ -z "$best_hub" ] || [ ${#h} -gt ${#best_hub} ]; then
                 best_hub="$h"
@@ -434,7 +443,7 @@ parse_static_location() {
 resolve_hub_port() {
     # Static-location devices: use location directly
     if [ -n "$RESOLVED_LOCATION" ]; then
-        read HUB PORT <<< "$(parse_static_location "$RESOLVED_LOCATION")"
+        read -r HUB PORT <<< "$(parse_static_location "$RESOLVED_LOCATION")"
         HOW="static"
         CACHED=""
         return 0
@@ -445,7 +454,7 @@ resolve_hub_port() {
     local result
     result=$(find_hub_port "$RESOLVED_MAC" "$RESOLVED_NAME") || \
         die "'$RESOLVED_NAME' ($RESOLVED_MAC) not found on any uhubctl-managed hub (and no last-known location in DB)"
-    read HUB PORT HOW CACHED <<< "$result"
+    read -r HUB PORT HOW CACHED <<< "$result"
     if [ "$CACHED" = "cached" ]; then
         echo "Note: using last-known location from DB (device not currently visible)" >&2
     fi
@@ -832,7 +841,7 @@ cmd_scan() {
         # Static-location devices: verify hub:port exists in uhubctl
         if [ -n "$location" ]; then
             local hub port
-            read hub port <<< "$(parse_static_location "$location")"
+            read -r hub port <<< "$(parse_static_location "$location")"
             # Check if uhubctl can see this hub
             if uhubctl -l "$hub" -p "$port" 2>/dev/null | grep -q "Port $port"; then
                 db_put "$name" "${mac:--}" "$hub" "$port" "static" "-"
@@ -850,7 +859,7 @@ cmd_scan() {
         serial_port=$(find_serial_port "$mac")
 
         if result=$(find_hub_port_live "$mac"); then
-            read hub port how <<< "$result"
+            read -r hub port how <<< "$result"
             db_evict_port "$hub" "$port" "$name"
             db_put "$name" "$mac" "$hub" "$port" "$how" "${serial_port:--}"
             printf "  %-30s  hub=%-6s port=%-4s dev=%-25s [found]\n" "$name" "$hub" "$port" "${serial_port:--}"
@@ -894,7 +903,7 @@ cmd_list() {
         # Static-location devices
         if [ -n "$location" ]; then
             local hub port
-            read hub port <<< "$(parse_static_location "$location")"
+            read -r hub port <<< "$(parse_static_location "$location")"
             local power_state=""
             if uhubctl -l "$hub" -p "$port" 2>/dev/null | grep -q "power"; then
                 power_state="[power on]"
@@ -908,7 +917,7 @@ cmd_list() {
         local result serial_port
         serial_port=$(find_serial_port "$mac")
         if result=$(find_hub_port_live "$mac"); then
-            read hub port how <<< "$result"
+            read -r hub port how <<< "$result"
             local label="[connected]"
             [ "$how" = "indirect" ] && label="[connected via sub-hub]"
             printf "  %-30s  type=%-6s id=%-20s  hub=%-6s port=%-4s dev=%-25s %s\n" "$name" "$type" "$mac" "$hub" "$port" "${serial_port:--}" "$label"
@@ -1006,7 +1015,7 @@ cmd_reset() {
             local new_result new_serial
             new_serial=$(find_serial_port "$RESOLVED_MAC")
             if new_result=$(find_hub_port_live "$RESOLVED_MAC"); then
-                read new_hub new_port new_how <<< "$new_result"
+                read -r new_hub new_port new_how <<< "$new_result"
                 db_put "$RESOLVED_NAME" "$RESOLVED_MAC" "$new_hub" "$new_port" "$new_how" "${new_serial:--}"
             fi
             return 0
@@ -1062,7 +1071,7 @@ cmd_reset() {
             local new_result new_serial
             new_serial=$(find_serial_port "$RESOLVED_MAC")
             if new_result=$(find_hub_port_live "$RESOLVED_MAC"); then
-                read new_hub new_port new_how <<< "$new_result"
+                read -r new_hub new_port new_how <<< "$new_result"
                 db_put "$RESOLVED_NAME" "$RESOLVED_MAC" "$new_hub" "$new_port" "$new_how" "${new_serial:--}"
             fi
             return 0
@@ -1167,6 +1176,7 @@ cmd_hub() {
 
 # Commands that don't take a device name
 case "${1:-}" in
+    version) echo "usb-device $USB_DEVICE_VERSION"; exit ;;
     list)  cmd_list; exit ;;
     scan)  cmd_scan; exit ;;
     check) cmd_check; exit ;;
@@ -1208,6 +1218,7 @@ usage: usb-device <command> [options] [device-name]
        usb-device <device-name> <command> [command ...]
 
 Commands:
+  version                       Print version and exit
   list                          Show all registered devices and their status
   scan                          Scan USB bus and update last-known locations
   check                         Verify all dependencies are installed

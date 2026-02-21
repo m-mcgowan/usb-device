@@ -119,9 +119,11 @@ if [ -n "$SHELL_RC" ]; then
     if grep -qF "scripts/usb-devices" "$SHELL_RC" 2>/dev/null; then
         echo "[ok] PATH already configured in $SHELL_RC"
     else
-        echo "" >> "$SHELL_RC"
-        echo "$PATH_COMMENT" >> "$SHELL_RC"
-        echo "export PATH=\"$SCRIPT_DIR:\$PATH\"" >> "$SHELL_RC"
+        {
+            echo ""
+            echo "$PATH_COMMENT"
+            echo "export PATH=\"$SCRIPT_DIR:\$PATH\""
+        } >> "$SHELL_RC"
         echo "[ok] added $SCRIPT_DIR to PATH in $SHELL_RC"
         echo "     run: source $SHELL_RC"
     fi

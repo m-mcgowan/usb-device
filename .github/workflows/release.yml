@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Homebrew packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            /usr/local/Cellar/bats-core
+            /usr/local/Cellar/jq
+            /usr/local/Cellar/uhubctl
+          key: brew-test-${{ runner.os }}
+
+      - name: Install dependencies
+        run: |
+          brew install bats-core jq uhubctl
+          pip3 install pyserial
+
+      - name: Run tests
+        run: bats test/
+
+  draft-release:
+    needs: test
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create tarball
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          tar czf "usb-device-${VERSION}.tar.gz" \
+            usb-device serial-monitor hub-agent \
+            hub_agent.py serial_monitor.py iokit_usb.py \
+            types.d/ devices.conf.example \
+            setup.sh install.sh VERSION LICENSE README.md
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: usb-device-*.tar.gz
