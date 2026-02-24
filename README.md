@@ -22,7 +22,7 @@ If you work with multiple USB dev boards, you know the pain:
 - **Type plugins** — board-specific commands (bootloader, boot) via extensible shell plugins
 - **Serial monitoring** — interactive and non-interactive, with device reset, delayed send, and timestamps
 - **Device locking** — `checkout`/`checkin` for CI jobs with TTL, wait, and stale lock recovery
-- **[USB Insight Hub](https://www.crowdsupply.com/aerio-solutions/usb-insight-hub) integration** — auto-updates per-port displays with device names and connection status, driven by IOKit USB events
+- **[USB Insight Hub](https://www.crowdsupply.com/aerio-solutions/usb-insight-hub) integration** — per-port power control via serial API (since uhubctl doesn't work on the Renesas hub), plus auto-updating displays with device names and connection status
 
 ## Install
 
@@ -99,8 +99,9 @@ Results are saved to `~/.config/usb-devices/locations.json`. This lets `find`, `
 
 When `reset` is called:
 
-1. **Port-level** — power-cycles just the device's port, waits up to 10s for re-enumeration
-2. **Hub-level** — if the device doesn't come back, escalates to cycling the entire hub. Warns about other devices on the same hub and prompts for confirmation (use `-f` to skip)
+1. **Insight Hub** — if the device is behind an Insight Hub, power-cycles via the serial API (verified), waits for re-enumeration
+2. **Port-level** — otherwise, power-cycles just the device's port via uhubctl, waits up to 10s for re-enumeration
+3. **Hub-level** — if the device doesn't come back, escalates to cycling the entire hub. Warns about other devices on the same hub and prompts for confirmation (use `-f` to skip)
 
 ### Device locking
 
@@ -119,7 +120,41 @@ Locks are advisory — mutating commands (`reset`, `off`, `on`, `bootloader`, `b
 
 ### USB Insight Hub integration
 
-Keep the [USB Insight Hub](https://www.crowdsupply.com/aerio-solutions/usb-insight-hub) displays updated with device names and connection status. Auto-detects the hub on the bus.
+The [USB Insight Hub](https://www.crowdsupply.com/aerio-solutions/usb-insight-hub) uses a Renesas uPD720210 hub chip that does **not** support standard USB power switching — `uhubctl` commands appear to succeed but have no effect on actual power. Real power control is handled by AP22653 switches driven by the hub's ESP32-S3 via a JSON serial API.
+
+`usb-device` auto-detects when a device is behind an Insight Hub and routes `reset`, `on`, and `off` through the serial API instead of uhubctl. No configuration needed — detection is automatic.
+
+#### Power control
+
+```bash
+usb-device reset "1.9"             # power-cycle via serial API, wait for re-enumeration
+usb-device off "1.9"               # power off via serial API
+usb-device on "1.9"                # power on via serial API
+```
+
+Power state is verified after each set command — the tool queries the hub to confirm the switch actually changed.
+
+#### Direct hub control (insight_hub.py)
+
+For low-level access, use `insight_hub.py` directly:
+
+```bash
+insight_hub.py detect                      # find hub, print serial port and location
+insight_hub.py status                      # summary of all 3 channels
+insight_hub.py power CH1 on                # power on channel 1
+insight_hub.py power CH2 off               # power off channel 2
+insight_hub.py cycle CH3                   # power cycle (off, 2s wait, on)
+insight_hub.py cycle CH1 5                 # power cycle with 5s off time
+insight_hub.py query CH1                   # full channel state (JSON)
+insight_hub.py voltage CH2                 # read voltage (mV)
+insight_hub.py current CH3                 # read current (mA)
+insight_hub.py data CH1 off                # disable USB 2.0 data lines (force re-enumeration)
+insight_hub.py set CH1 fwdLimit 500        # set any channel parameter
+insight_hub.py get startUpmode             # read global parameters
+insight_hub.py get CH1 CH2 CH3             # read multiple parameters
+```
+
+#### Display management
 
 ```bash
 usb-device hub status              # show hub info and channel assignments
@@ -343,7 +378,7 @@ Only define the functions your type supports. Missing functions = command not av
 ## Tests
 
 ```bash
-# All tests
+# All bats tests
 bats test/
 
 # Basic tests (real environment)
@@ -351,6 +386,9 @@ bats test/usb-device.bats
 
 # Mock tests (simulated devices, no hardware needed)
 bats test/usb-device-mock.bats
+
+# Python unit tests (insight_hub.py)
+.venv/bin/python3 -m pytest test/test_insight_hub.py -v
 ```
 
 Requires [bats-core](https://github.com/bats-core/bats-core): `brew install bats-core`

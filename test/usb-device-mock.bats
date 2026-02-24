@@ -34,7 +34,95 @@ MOCK
     # MOCK_PYSERIAL_DEVICES is a file with lines: SERIAL_NUMBER|DEVICE|LOCATION
     cat > "$MOCK_BIN/python3" << 'MOCK'
 #!/bin/bash
-# Parse the python -c "..." argument to figure out what's being requested
+# Mock python3 — handles both inline -c scripts and insight_hub.py calls.
+
+# ── insight_hub.py mock ──────────────────────────────────────────
+# MOCK_INSIGHT_HUB_PORT and MOCK_INSIGHT_HUB_LOCATION control detect.
+# MOCK_INSIGHT_HUB_STATE is a file with lines: CHx|powerEn|dataEn|voltage|current
+# MOCK_INSIGHT_HUB_LOG records all power/cycle commands for verification.
+
+if [[ "$1" == *"insight_hub.py" ]]; then
+    CMD="$2"
+    case "$CMD" in
+        detect)
+            if [ -n "${MOCK_INSIGHT_HUB_PORT:-}" ]; then
+                printf '%s\t%s\n' "$MOCK_INSIGHT_HUB_PORT" "${MOCK_INSIGHT_HUB_LOCATION:-unknown}"
+                exit 0
+            fi
+            exit 1
+            ;;
+        channel)
+            # $3 = hub_location, $4 = port
+            PORT_NUM="$4"
+            if [ -n "$PORT_NUM" ] && [ "$PORT_NUM" -ge 1 ] 2>/dev/null && [ "$PORT_NUM" -le 3 ]; then
+                echo "CH${PORT_NUM}"
+                exit 0
+            fi
+            echo "error: port $PORT_NUM is not a device channel (1-3)" >&2
+            exit 1
+            ;;
+        power)
+            # $3 = CHx, $4 = on|off
+            CHANNEL="$3"
+            STATE="$4"
+            echo "$CMD $CHANNEL $STATE" >> "${MOCK_INSIGHT_HUB_LOG:-/dev/null}"
+            echo "$CHANNEL power $STATE" >&2
+            exit 0
+            ;;
+        cycle)
+            # $3 = CHx, $4 = off_seconds (optional)
+            CHANNEL="$3"
+            OFFTIME="${4:-2}"
+            echo "$CMD $CHANNEL $OFFTIME" >> "${MOCK_INSIGHT_HUB_LOG:-/dev/null}"
+            echo "Power off $CHANNEL..." >&2
+            echo "Power on $CHANNEL..." >&2
+            exit 0
+            ;;
+        query)
+            # $3 = CHx — return mock state as JSON
+            CHANNEL="$3"
+            STATE_FILE="${MOCK_INSIGHT_HUB_STATE:-}"
+            if [ -n "$STATE_FILE" ] && [ -f "$STATE_FILE" ]; then
+                LINE=$(grep "^$CHANNEL|" "$STATE_FILE" | head -1)
+                if [ -n "$LINE" ]; then
+                    IFS='|' read -r _ pwr data volt curr <<< "$LINE"
+                    cat <<EJSON
+{
+  "powerEn": $pwr,
+  "dataEn": $data,
+  "voltage": "$volt",
+  "current": "$curr",
+  "fwdAlert": false,
+  "backAlert": false,
+  "shortAlert": false
+}
+EJSON
+                    exit 0
+                fi
+            fi
+            echo "error: query $CHANNEL failed" >&2
+            exit 1
+            ;;
+        status)
+            STATE_FILE="${MOCK_INSIGHT_HUB_STATE:-}"
+            if [ -n "$STATE_FILE" ] && [ -f "$STATE_FILE" ]; then
+                while IFS='|' read -r ch pwr data volt curr; do
+                    pwrstr="OFF"; [ "$pwr" = "true" ] && pwrstr="ON"
+                    datastr="no-data"; [ "$data" = "true" ] && datastr="data"
+                    echo "$ch: power=$pwrstr $datastr  ${volt}mV  ${curr}mA"
+                done < "$STATE_FILE"
+                exit 0
+            fi
+            exit 1
+            ;;
+        *)
+            echo "error: unknown command '$CMD'" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+# ── pyserial comports mock ───────────────────────────────────────
 SCRIPT="$2"
 MOCK_FILE="${MOCK_PYSERIAL_DEVICES:-/dev/null}"
 
@@ -92,6 +180,29 @@ mock_pyserial() {
     MOCK_PYSERIAL_DEVICES="$TEST_DIR/pyserial_devices"
     export MOCK_PYSERIAL_DEVICES
     cat > "$MOCK_PYSERIAL_DEVICES"
+}
+
+# Set up mock Insight Hub (serial port + hub location)
+mock_insight_hub() {
+    local port="${1:-/dev/cu.usbmodemHUB1}"
+    local location="${2:-20-3}"
+    export MOCK_INSIGHT_HUB_PORT="$port"
+    export MOCK_INSIGHT_HUB_LOCATION="$location"
+    export MOCK_INSIGHT_HUB_LOG="$TEST_DIR/insight_hub_log"
+    : > "$MOCK_INSIGHT_HUB_LOG"
+}
+
+# Set mock Insight Hub channel state: CHx|powerEn|dataEn|voltage|current
+mock_insight_hub_state() {
+    MOCK_INSIGHT_HUB_STATE="$TEST_DIR/insight_hub_state"
+    export MOCK_INSIGHT_HUB_STATE
+    cat > "$MOCK_INSIGHT_HUB_STATE"
+}
+
+# Clear Insight Hub mock (hub not present)
+mock_no_insight_hub() {
+    unset MOCK_INSIGHT_HUB_PORT MOCK_INSIGHT_HUB_LOCATION
+    unset MOCK_INSIGHT_HUB_STATE MOCK_INSIGHT_HUB_LOG
 }
 
 # ── Scenario: device on a ppps hub (direct) ──────────────────────
@@ -871,6 +982,56 @@ EOF
     [[ "$output" != *"hub:insight"* ]]
 }
 
+@test "plugin: subdirectory plugin found" {
+    cat > "$CONF" << 'EOF'
+[Board Alpha]
+mac=AA:AA:AA:AA:AA:AA
+type=subtest
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-2.1
+EOF
+
+    # Create a plugin in a subdirectory (simulates symlinked project types)
+    mkdir -p "$TEST_DIR/types.d/my-project"
+    cat > "$TEST_DIR/types.d/my-project/subtest.sh" << 'PLUGIN'
+type_subtest_bootloader() {
+    echo "SUBDIR_PLUGIN port=$1 name=$2"
+}
+PLUGIN
+
+    run "$USB_DEVICE" bootloader "Board Alpha"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SUBDIR_PLUGIN port=/dev/cu.usbmodem101 name=Board Alpha"* ]]
+}
+
+@test "plugin: flat file takes priority over subdirectory" {
+    cat > "$CONF" << 'EOF'
+[Board Alpha]
+mac=AA:AA:AA:AA:AA:AA
+type=pritest
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-2.1
+EOF
+
+    # Create flat plugin (should win)
+    mkdir -p "$TEST_DIR/types.d"
+    cat > "$TEST_DIR/types.d/pritest.sh" << 'PLUGIN'
+type_pritest_bootloader() { echo "FLAT_WINS"; }
+PLUGIN
+
+    # Create same plugin in subdirectory (should lose)
+    mkdir -p "$TEST_DIR/types.d/my-project"
+    cat > "$TEST_DIR/types.d/my-project/pritest.sh" << 'PLUGIN'
+type_pritest_bootloader() { echo "SUBDIR_LOSES"; }
+PLUGIN
+
+    run "$USB_DEVICE" bootloader "Board Alpha"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"FLAT_WINS"* ]]
+}
+
 @test "INI: list shows type for all devices" {
     cat > "$CONF" << 'EOF'
 Device A=AA:AA:AA:AA:AA:AA
@@ -897,4 +1058,186 @@ EOF
     [[ "$output" == *"type=ppk2"* ]]
     [[ "$output" == *"Charger A"* ]]
     [[ "$output" == *"type=power"* ]]
+}
+
+# ── Insight Hub integration ──────────────────────────────────────
+
+@test "insight hub: off routes through serial API when device is on hub" {
+    mock_insight_hub "/dev/cu.usbmodemHUB1" "20-3"
+    mock_uhubctl << 'EOF'
+Current status for hub 20-3, vendor 0451:8142, USB 3.10, 4 ports, ppps
+  Port 2: 0503 power highspeed enable connect [303a:1001 AA:AA:AA:AA:AA:AA]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-3.2
+EOF
+
+    run "$USB_DEVICE" off "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Insight Hub"* ]]
+    [[ "$output" == *"CH2"* ]]
+
+    # Verify the right command was logged
+    run cat "$TEST_DIR/insight_hub_log"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"power CH2 off"* ]]
+}
+
+@test "insight hub: on routes through serial API when device is on hub" {
+    mock_insight_hub "/dev/cu.usbmodemHUB1" "20-3"
+    mock_uhubctl << 'EOF'
+Current status for hub 20-3, vendor 0451:8142, USB 3.10, 4 ports, ppps
+  Port 1: 0503 power highspeed enable connect [303a:1001 AA:AA:AA:AA:AA:AA]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-3.1
+EOF
+
+    run "$USB_DEVICE" on "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Insight Hub"* ]]
+    [[ "$output" == *"CH1"* ]]
+
+    run cat "$TEST_DIR/insight_hub_log"
+    [[ "$output" == *"power CH1 on"* ]]
+}
+
+@test "insight hub: reset uses cycle command" {
+    mock_insight_hub "/dev/cu.usbmodemHUB1" "20-3"
+    mock_uhubctl << 'EOF'
+Current status for hub 20-3, vendor 0451:8142, USB 3.10, 4 ports, ppps
+  Port 3: 0503 power highspeed enable connect [303a:1001 AA:AA:AA:AA:AA:AA]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-3.3
+EOF
+
+    # Device won't "come back" in mock, but the cycle command should be issued
+    run "$USB_DEVICE" reset "Device A"
+    # reset will fail because device_is_alive won't see the device after cycle,
+    # but we can verify the cycle was attempted
+    [[ "$output" == *"Insight Hub"* ]]
+    [[ "$output" == *"CH3"* ]]
+
+    run cat "$TEST_DIR/insight_hub_log"
+    [[ "$output" == *"cycle CH3 2"* ]]
+}
+
+@test "insight hub: device NOT on hub falls through to uhubctl" {
+    mock_insight_hub "/dev/cu.usbmodemHUB1" "20-3"
+    # Device is on hub 20-2, NOT 20-3 (the Insight Hub)
+    mock_uhubctl << 'EOF'
+Current status for hub 20-2, vendor 2109:2817, USB 3.20, 4 ports, ppps
+  Port 1: 0503 power highspeed enable connect [303a:1001 AA:AA:AA:AA:AA:AA]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-2.1
+EOF
+
+    # Need a mock sudo that passes through to uhubctl
+    cat > "$MOCK_BIN/sudo" << 'SUDMOCK'
+#!/bin/bash
+"$@"
+SUDMOCK
+    chmod +x "$MOCK_BIN/sudo"
+
+    run "$USB_DEVICE" off "Device A"
+    [ "$status" -eq 0 ]
+    # Should NOT mention Insight Hub
+    [[ "$output" != *"Insight Hub"* ]]
+    [[ "$output" == *"hub 20-2"* ]]
+}
+
+@test "insight hub: no hub present falls through to uhubctl" {
+    mock_no_insight_hub
+    mock_uhubctl << 'EOF'
+Current status for hub 20-2, vendor 2109:2817, USB 3.20, 4 ports, ppps
+  Port 1: 0503 power highspeed enable connect [303a:1001 AA:AA:AA:AA:AA:AA]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-2.1
+EOF
+
+    cat > "$MOCK_BIN/sudo" << 'SUDMOCK'
+#!/bin/bash
+"$@"
+SUDMOCK
+    chmod +x "$MOCK_BIN/sudo"
+
+    run "$USB_DEVICE" off "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Insight Hub"* ]]
+    [[ "$output" == *"hub 20-2"* ]]
+}
+
+@test "insight hub: child hub location matches (device behind sub-hub)" {
+    # Insight Hub at 20-3, device behind sub-hub at 20-3.2.1
+    mock_insight_hub "/dev/cu.usbmodemHUB1" "20-3"
+    mock_uhubctl << 'EOF'
+Current status for hub 20-3, vendor 0451:8142, USB 3.10, 4 ports, ppps
+  Port 2: 0503 power highspeed enable connect [045b:0209 USB2.0 Hub]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-3.2.1
+EOF
+
+    run "$USB_DEVICE" off "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Insight Hub"* ]]
+    [[ "$output" == *"CH2"* ]]
+
+    run cat "$TEST_DIR/insight_hub_log"
+    [[ "$output" == *"power CH2 off"* ]]
+}
+
+@test "insight hub: port 4+ not mapped to channel (falls through)" {
+    # Insight Hub only has 3 channels. If a device is on port 4,
+    # channel mapping should fail and it should fall through to uhubctl.
+    mock_insight_hub "/dev/cu.usbmodemHUB1" "20-3"
+    mock_uhubctl << 'EOF'
+Current status for hub 20-3, vendor 0451:8142, USB 3.10, 4 ports, ppps
+  Port 4: 0503 power highspeed enable connect [303a:1001 AA:AA:AA:AA:AA:AA]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-3.4
+EOF
+
+    cat > "$MOCK_BIN/sudo" << 'SUDMOCK'
+#!/bin/bash
+"$@"
+SUDMOCK
+    chmod +x "$MOCK_BIN/sudo"
+
+    run "$USB_DEVICE" off "Device A"
+    [ "$status" -eq 0 ]
+    # Port 4 can't be mapped to CH1-3, so should NOT use Insight Hub
+    [[ "$output" != *"Insight Hub"* ]]
+}
+
+@test "insight hub: cached location used when device offline" {
+    mock_insight_hub "/dev/cu.usbmodemHUB1" "20-3"
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    # Device was previously seen on Insight Hub port 1
+    cat > "$DB" << 'EOF'
+{
+    "Device A": {
+        "mac": "AA:AA:AA:AA:AA:AA",
+        "hub": "20-3",
+        "port": "1",
+        "link": "direct",
+        "dev": "/dev/cu.usbmodem101",
+        "last_seen": "2026-02-20T10:00:00Z"
+    }
+}
+EOF
+
+    run "$USB_DEVICE" off "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Insight Hub"* ]]
+    [[ "$output" == *"CH1"* ]]
+
+    run cat "$TEST_DIR/insight_hub_log"
+    [[ "$output" == *"power CH1 off"* ]]
 }
