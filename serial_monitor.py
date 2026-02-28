@@ -28,6 +28,8 @@ Interactive keys (TTY only):
 """
 
 import argparse
+import codecs
+import re
 import os
 import signal
 import subprocess
@@ -117,7 +119,7 @@ def power_reset(name_or_port: str, force: bool = False):
 
 class SerialMonitor:
     def __init__(self, port: str, baud: int = 115200, timestamps: bool = False,
-                 timeout: float = 0):
+                 timeout: float = 0, exit_patterns: list = None):
         self.port = port
         self.baud = baud
         self.timestamps = timestamps
@@ -126,6 +128,7 @@ class SerialMonitor:
         self._ser = None
         self._old_term = None
         self._send_queue = []  # list of (delay_secs, bytes_data)
+        self._exit_patterns = [re.compile(p) for p in (exit_patterns or [])]
 
     def queue_send(self, data: bytes, delay: float = 0):
         """Queue data to send after connection opens. Delay is seconds to wait before sending."""
@@ -157,6 +160,10 @@ class SerialMonitor:
     def _read_loop(self):
         """Read from serial and write to stdout. Runs until self.running is False."""
         line_start = True
+        line_buf = []
+        # Incremental decoder buffers incomplete multi-byte UTF-8 sequences
+        # across read boundaries instead of emitting replacement characters
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
         while self.running:
             try:
                 data = self._ser.read(self._ser.in_waiting or 1)
@@ -165,12 +172,13 @@ class SerialMonitor:
                     break
                 print(f"\n[monitor] Connection lost. Reconnecting...", file=sys.stderr)
                 self._reconnect()
+                decoder.reset()
                 continue
 
             if not data:
                 continue
 
-            text = data.decode("utf-8", errors="replace")
+            text = decoder.decode(data)
             for ch in text:
                 if line_start and self.timestamps:
                     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -179,6 +187,17 @@ class SerialMonitor:
                 sys.stdout.write(ch)
                 if ch == "\n":
                     line_start = True
+                    if self._exit_patterns:
+                        line = "".join(line_buf)
+                        line_buf.clear()
+                        for pat in self._exit_patterns:
+                            if pat.search(line):
+                                sys.stdout.flush()
+                                print(f"\n[monitor] Exit pattern matched: {pat.pattern}", file=sys.stderr)
+                                self.running = False
+                                return
+                elif ch != "\r":
+                    line_buf.append(ch)
             sys.stdout.flush()
 
     def _reconnect(self):
@@ -332,6 +351,9 @@ def main():
                         help="Send DATA to serial after connecting (can repeat). "
                              "Use \\n for newline. Prefix with @SECSx to delay, "
                              "e.g. --send '@2xT' sends 'T' after 2s delay.")
+    parser.add_argument("--exit-on", action="append", default=[], metavar="PATTERN",
+                        help="Exit when a line matches this regex (can repeat). "
+                             "Patterns without regex metacharacters match as plain strings.")
     parser.add_argument("--device-type", default=None, metavar="TYPE",
                         help=argparse.SUPPRESS)  # set by serial-monitor wrapper
     args = parser.parse_args()
@@ -369,7 +391,8 @@ def main():
     elif args.reset:
         reset_via_baud_touch(port)
 
-    monitor = SerialMonitor(port, args.baud, args.timestamps, args.timeout)
+    monitor = SerialMonitor(port, args.baud, args.timestamps, args.timeout,
+                            exit_patterns=args.exit_on)
 
     # Parse --send arguments
     for item in args.send:
