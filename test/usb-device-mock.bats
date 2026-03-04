@@ -126,22 +126,89 @@ fi
 SCRIPT="$2"
 MOCK_FILE="${MOCK_PYSERIAL_DEVICES:-/dev/null}"
 
-# Extract the serial number from the python snippet: p.serial_number == 'VALUE'
+# Extract the serial number from the python snippet.
+# Supports both old format: p.serial_number == 'VALUE'
+# and new normalized format: norm = 'VALUE'
 extract_serial() {
-    echo "$1" | grep -oE "serial_number == '[^']+'" | sed "s/serial_number == '//;s/'//"
+    local sn
+    sn=$(echo "$1" | grep -oE "serial_number == '[^']+'" | sed "s/serial_number == '//;s/'//")
+    [ -n "$sn" ] && { echo "$sn"; return; }
+    sn=$(echo "$1" | grep -oE "norm = '[^']+'" | sed "s/norm = '//;s/'//")
+    echo "$sn"
 }
 
-if [[ "$SCRIPT" == *"serial_number"* && "$SCRIPT" == *"p.device"* ]]; then
+# Normalize a MAC: strip colons/dashes, lowercase
+normalize_sn() {
+    echo "$1" | tr -d ':-' | tr '[:upper:]' '[:lower:]'
+}
+
+# Find a device in the mock file by normalized MAC comparison
+# Returns the matching line or empty
+find_mock_device() {
+    local target_norm="$1"
+    local mock_file="$2"
+    [ -f "$mock_file" ] || return 1
+    while IFS= read -r line; do
+        local sn
+        sn=$(echo "$line" | cut -d'|' -f1)
+        local sn_norm
+        sn_norm=$(normalize_sn "$sn")
+        if [ "$sn_norm" = "$target_norm" ]; then
+            echo "$line"
+            return 0
+        fi
+    done < "$mock_file"
+    return 1
+}
+
+if [[ "$SCRIPT" == *"p.device == port"* && "$SCRIPT" == *"serial_number"* ]]; then
+    # cmd_register auto-detect: match by port path, print serial_number\tdescription
+    # The script sets: port = '/dev/cu.xxx'
+    PORT_PATH=$(echo "$SCRIPT" | grep -oE "port = '[^']+'" | sed "s/port = '//;s/'//")
+    if [ -n "$PORT_PATH" ] && [ -f "$MOCK_FILE" ]; then
+        while IFS= read -r line; do
+            DEV=$(echo "$line" | cut -d'|' -f2)
+            if [ "$DEV" = "$PORT_PATH" ]; then
+                SN=$(echo "$line" | cut -d'|' -f1)
+                DESC=$(echo "$line" | cut -d'|' -f4 -s)
+                printf '%s\t%s\n' "$SN" "${DESC:-USB device}"
+                exit 0
+            fi
+        done < "$MOCK_FILE"
+    fi
+elif [[ "$SCRIPT" == *"serial_number"* && "$SCRIPT" == *"p.device"* ]] || \
+   [[ "$SCRIPT" == *"sn == norm"* && "$SCRIPT" == *"p.device"* ]]; then
     # find_serial_port: looking for serial number, print device
     SN=$(extract_serial "$SCRIPT")
-    if [ -n "$SN" ] && [ -f "$MOCK_FILE" ]; then
-        grep "^$SN|" "$MOCK_FILE" | head -1 | cut -d'|' -f2
+    SN_NORM=$(normalize_sn "$SN")
+    if [ -n "$SN_NORM" ] && [ -f "$MOCK_FILE" ]; then
+        LINE=$(find_mock_device "$SN_NORM" "$MOCK_FILE")
+        [ -n "$LINE" ] && echo "$LINE" | cut -d'|' -f2
     fi
-elif [[ "$SCRIPT" == *"serial_number"* && "$SCRIPT" == *"p.location"* ]]; then
+elif [[ "$SCRIPT" == *"serial_number"* && "$SCRIPT" == *"p.location"* ]] || \
+     [[ "$SCRIPT" == *"sn == norm"* && "$SCRIPT" == *"p.location"* ]]; then
     # find_hub_port_live fallback: looking for serial number, print location
     SN=$(extract_serial "$SCRIPT")
-    if [ -n "$SN" ] && [ -f "$MOCK_FILE" ]; then
-        grep "^$SN|" "$MOCK_FILE" | head -1 | cut -d'|' -f3
+    SN_NORM=$(normalize_sn "$SN")
+    if [ -n "$SN_NORM" ] && [ -f "$MOCK_FILE" ]; then
+        LINE=$(find_mock_device "$SN_NORM" "$MOCK_FILE")
+        [ -n "$LINE" ] && echo "$LINE" | cut -d'|' -f3
+    fi
+elif [[ "$SCRIPT" == *"sn == norm"* && "$SCRIPT" == *"p.product"* ]]; then
+    # detect_device_mode: looking for product string
+    SN=$(extract_serial "$SCRIPT")
+    SN_NORM=$(normalize_sn "$SN")
+    if [ -n "$SN_NORM" ] && [ -f "$MOCK_FILE" ]; then
+        LINE=$(find_mock_device "$SN_NORM" "$MOCK_FILE")
+        if [ -n "$LINE" ]; then
+            # Check for optional 4th field: product name
+            PRODUCT=$(echo "$LINE" | cut -d'|' -f4 -s)
+            if [ "$PRODUCT" = "USB JTAG/serial debug unit" ]; then
+                echo "bootloader"
+            else
+                echo "app"
+            fi
+        fi
     fi
 elif [[ "$SCRIPT" == *"import esptool"* ]]; then
     exit 0
@@ -1240,4 +1307,253 @@ EOF
 
     run cat "$TEST_DIR/insight_hub_log"
     [[ "$output" == *"power CH1 off"* ]]
+}
+
+# ── MAC normalization ─────────────────────────────────────────────
+
+@test "scan: finds device with colon-separated MAC (bootloader format)" {
+    cat > "$CONF" << 'EOF'
+[Insight Hub]
+mac=B43A45B5582C
+type=insight_hub
+EOF
+    # Device is in bootloader — serial has colons
+    mock_uhubctl << 'EOF'
+Current status for hub 20-3.3 [045b:0209, USB 2.00, 4 ports, ppps]
+  Port 4: 0103 power enable connect [303a:1001 B4:3A:45:B5:58:2C USB JTAG/serial debug unit]
+EOF
+    mock_pyserial << 'EOF'
+B4:3A:45:B5:58:2C|/dev/cu.usbmodem1433401|20-3.3.4|USB JTAG/serial debug unit
+EOF
+
+    run "$USB_DEVICE" scan
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Insight Hub"* ]]
+    [[ "$output" == *"hub=20-3.3"* ]]
+    [[ "$output" == *"port=4"* ]]
+    [[ "$output" == *"BOOTLOADER"* ]]
+}
+
+@test "scan: finds device with no-colon MAC (app mode)" {
+    cat > "$CONF" << 'EOF'
+[Insight Hub]
+mac=B43A45B5582C
+type=insight_hub
+EOF
+    mock_uhubctl << 'EOF'
+Current status for hub 20-3.3 [045b:0209, USB 2.00, 4 ports, ppps]
+  Port 4: 0103 power enable connect [303a:1001 Aerio InsightHUB Controller B43A45B5582C]
+EOF
+    mock_pyserial << 'EOF'
+B43A45B5582C|/dev/cu.usbmodemB43A45B5582C1|20-3.3.4|InsightHUB Controller
+EOF
+
+    run "$USB_DEVICE" scan
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Insight Hub"* ]]
+    [[ "$output" == *"[found]"* ]]
+    [[ "$output" != *"BOOTLOADER"* ]]
+}
+
+@test "port: finds device by normalized MAC when serial has colons" {
+    cat > "$CONF" << 'EOF'
+[Insight Hub]
+mac=B43A45B5582C
+type=insight_hub
+EOF
+    # Device in bootloader mode — pyserial reports serial with colons
+    mock_pyserial << 'EOF'
+B4:3A:45:B5:58:2C|/dev/cu.usbmodem1433401|20-3.3.4
+EOF
+
+    run "$USB_DEVICE" port "Insight Hub"
+    [ "$status" -eq 0 ]
+    [ "$output" = "/dev/cu.usbmodem1433401" ]
+}
+
+@test "find: normalized MAC matches across formats" {
+    cat > "$CONF" << 'EOF'
+[Insight Hub]
+mac=B43A45B5582C
+type=insight_hub
+EOF
+    # uhubctl shows the hub but device is behind a sub-hub (indirect match)
+    mock_uhubctl << 'EOF'
+Current status for hub 20-3.3 [045b:0209, USB 2.00, 4 ports, ppps]
+  Port 4: 0103 power enable connect [303a:1001 B4:3A:45:B5:58:2C USB JTAG/serial debug unit]
+EOF
+    mock_pyserial << 'EOF'
+B4:3A:45:B5:58:2C|/dev/cu.usbmodem1433401|20-3.3.4
+EOF
+
+    run "$USB_DEVICE" find "Insight Hub"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"dev:  /dev/cu.usbmodem1433401"* ]]
+    [[ "$output" == *"hub:  20-3.3"* ]]
+    [[ "$output" == *"port: 4"* ]]
+}
+
+# ── Help command ─────────────────────────────────────────────────
+
+@test "help: shows usage text" {
+    run "$USB_DEVICE" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"usage: usb-device"* ]]
+    [[ "$output" == *"register"* ]]
+    [[ "$output" == *"Commands:"* ]]
+}
+
+@test "help: --help flag works" {
+    run "$USB_DEVICE" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"usage: usb-device"* ]]
+}
+
+@test "help: -h flag works" {
+    run "$USB_DEVICE" -h
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"usage: usb-device"* ]]
+}
+
+@test "help: no args shows usage" {
+    run "$USB_DEVICE"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"usage: usb-device"* ]]
+}
+
+# ── Register command ─────────────────────────────────────────────
+
+@test "register: with explicit MAC creates config entry" {
+    cat > "$CONF" << 'EOF'
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    run "$USB_DEVICE" register "New Board" --mac "DD:DD:DD:DD:DD:DD" --type esp32 --chip esp32s3
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Registered 'New Board'"* ]]
+    [[ "$output" == *"mac=DD:DD:DD:DD:DD:DD"* ]]
+
+    # Config file should have the new section
+    run grep "\[New Board\]" "$CONF"
+    [ "$status" -eq 0 ]
+    run grep "mac=DD:DD:DD:DD:DD:DD" "$CONF"
+    [ "$status" -eq 0 ]
+    run grep "type=esp32" "$CONF"
+    [ "$status" -eq 0 ]
+    run grep "chip=esp32s3" "$CONF"
+    [ "$status" -eq 0 ]
+}
+
+@test "register: auto-detect from port" {
+    cat > "$CONF" << 'EOF'
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial << 'EOF'
+EE:EE:EE:EE:EE:EE|/dev/cu.usbmodem201|20-2.1|USB JTAG/serial debug unit
+EOF
+
+    run "$USB_DEVICE" register "Auto Board" --port /dev/cu.usbmodem201
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Detected:"* ]]
+    [[ "$output" == *"Serial:"*"EE:EE:EE:EE:EE:EE"* ]]
+    [[ "$output" == *"Registered 'Auto Board'"* ]]
+
+    run grep "mac=EE:EE:EE:EE:EE:EE" "$CONF"
+    [ "$status" -eq 0 ]
+}
+
+@test "register: duplicate name is rejected" {
+    cat > "$CONF" << 'EOF'
+[Existing Board]
+mac=AA:AA:AA:AA:AA:AA
+type=esp32
+EOF
+
+    run "$USB_DEVICE" register "Existing Board" --mac "BB:BB:BB:BB:BB:BB"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"already registered"* ]]
+}
+
+@test "register: fails without --port or --mac" {
+    run "$USB_DEVICE" register "Lonely Board"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"must specify --port or --mac"* ]]
+}
+
+@test "register: fails without name" {
+    run "$USB_DEVICE" register --mac "AA:BB:CC:DD:EE:FF"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"usage:"* ]]
+}
+
+@test "register: port not found gives clear error" {
+    cat > "$CONF" << 'EOF'
+EOF
+    mock_pyserial < /dev/null
+
+    run "$USB_DEVICE" register "Ghost Board" --port /dev/cu.nonexistent
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"no device found on port"* ]]
+}
+
+@test "register: --serial flag works same as --mac" {
+    cat > "$CONF" << 'EOF'
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    run "$USB_DEVICE" register "Serial Board" --serial "FF:FF:FF:FF:FF:FF"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Registered 'Serial Board'"* ]]
+    run grep "mac=FF:FF:FF:FF:FF:FF" "$CONF"
+    [ "$status" -eq 0 ]
+}
+
+@test "register: custom type and chip" {
+    cat > "$CONF" << 'EOF'
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    run "$USB_DEVICE" register "PPK Board" --mac "11:22:33:44:55:66" --type ppk2 --chip nrf52840
+    [ "$status" -eq 0 ]
+    run grep "type=ppk2" "$CONF"
+    [ "$status" -eq 0 ]
+    run grep "chip=nrf52840" "$CONF"
+    [ "$status" -eq 0 ]
+}
+
+@test "register: hub-name option" {
+    cat > "$CONF" << 'EOF'
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    run "$USB_DEVICE" register "Hub Board" --mac "AA:BB:CC:DD:EE:FF" --hub-name "My Board"
+    [ "$status" -eq 0 ]
+    run grep "hub_name=My Board" "$CONF"
+    [ "$status" -eq 0 ]
+}
+
+@test "register: triggers scan after registration" {
+    cat > "$CONF" << 'EOF'
+EOF
+    mock_uhubctl << 'EOF'
+Current status for hub 20-2, vendor 2109:2817, USB 3.20, 4 ports, ppps
+  Port 1: 0503 power highspeed enable connect [1d50:6018 AA:BB:CC:DD:EE:FF USB JTAG/serial debug unit]
+EOF
+    mock_pyserial << 'EOF'
+AA:BB:CC:DD:EE:FF|/dev/cu.usbmodem101|20-2.1
+EOF
+
+    run "$USB_DEVICE" register "Scan Board" --mac "AA:BB:CC:DD:EE:FF"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Scanning USB bus"* ]]
+    [[ "$output" == *"Scan Board"* ]]
+    [[ "$output" == *"[found]"* ]]
+
+    # DB should be populated
+    run jq -r '.["Scan Board"].hub' "$DB"
+    [ "$output" = "20-2" ]
 }
