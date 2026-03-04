@@ -358,14 +358,18 @@ resolve_device() {
 # falls back to pyserial's LOCATION field to find the nearest controllable port.
 find_hub_port_live() {
     local mac="$1"
+    local norm
+    norm=$(normalize_mac "$mac")
 
-    # Try direct match in uhubctl output
+    # Try direct match in uhubctl output (normalized comparison)
     local hub="" port=""
     while IFS= read -r line; do
         if [[ "$line" =~ "hub " ]]; then
             hub=$(echo "$line" | sed -E 's/.*hub ([^ ,]+).*/\1/')
         fi
-        if [[ "$line" == *"$mac"* ]]; then
+        local line_norm
+        line_norm=$(echo "$line" | tr -d ':-' | tr '[:upper:]' '[:lower:]')
+        if [[ "$line_norm" == *"$norm"* ]]; then
             port=$(echo "$line" | sed -E 's/.*Port ([0-9]+).*/\1/')
             echo "$hub $port direct"
             return 0
@@ -376,8 +380,10 @@ find_hub_port_live() {
     local location
     location=$($PYTHON -c "
 from serial.tools.list_ports import comports
+norm = '$norm'
 for p in comports():
-    if p.serial_number == '$mac':
+    sn = (p.serial_number or '').replace(':', '').replace('-', '').lower()
+    if sn == norm:
         print(p.location or '')
         break
 " 2>/dev/null)
@@ -440,14 +446,41 @@ find_hub_port() {
     return 1
 }
 
-# Find /dev/cu.* path for a MAC address via pyserial
+# Normalize a MAC/serial: strip colons, dashes, lowercase
+normalize_mac() { echo "${1//[:\-]/}" | tr '[:upper:]' '[:lower:]'; }
+
+# Find /dev/cu.* path for a MAC address via pyserial (normalized comparison)
 find_serial_port() {
     local mac="$1"
+    local norm
+    norm=$(normalize_mac "$mac")
     $PYTHON -c "
 from serial.tools.list_ports import comports
+norm = '$norm'
 for p in comports():
-    if p.serial_number == '$mac':
+    sn = (p.serial_number or '').replace(':', '').replace('-', '').lower()
+    if sn == norm:
         print(p.device)
+        break
+" 2>/dev/null
+}
+
+# Detect USB device mode (app vs bootloader) by product string
+# Returns: "app", "bootloader", or empty if not found
+detect_device_mode() {
+    local mac="$1"
+    local norm
+    norm=$(normalize_mac "$mac")
+    $PYTHON -c "
+from serial.tools.list_ports import comports
+norm = '$norm'
+for p in comports():
+    sn = (p.serial_number or '').replace(':', '').replace('-', '').lower()
+    if sn == norm:
+        if p.product == 'USB JTAG/serial debug unit':
+            print('bootloader')
+        else:
+            print('app')
         break
 " 2>/dev/null
 }
@@ -841,6 +874,60 @@ check_lock_warning() {
     echo "WARNING: '$name' is checked out by ${owner:-unknown} (pid ${lock_pid:-?})" >&2
 }
 
+# ── Help ──────────────────────────────────────────────────────────
+
+cmd_help() {
+    cat <<'USAGE'
+usage: usb-device <command> [options] [device-name]
+       usb-device <device-name> <command> [command ...]
+
+Commands:
+  version                       Print version and exit
+  help                          Show this help message
+  list                          Show all registered devices and their status
+  scan                          Scan USB bus and update last-known locations
+  check                         Verify all dependencies are installed
+  register <name> [options]     Register a new device
+  find <name>                   Show hub, port, serial device info
+  type <name>                   Print device type (for scripting)
+  reset [-f|--force] <name>     Power-cycle a device (escalates to hub if needed)
+  off <name>                    Turn off power to a device
+  on <name>                     Turn on power to a device
+  port <name>                   Print /dev/cu.* path
+  bootloader <name>             Enter bootloader (requires type plugin)
+  boot <name>                   Exit bootloader (requires type plugin)
+  checkout [opts] <name> [...]  Acquire exclusive access (multi-device: sorted, all-or-nothing)
+  checkin [-f] <name> [...]     Release exclusive access
+  locks                         Show all checked-out devices
+  hub status                    Show Insight Hub channels and device assignments
+  hub sync                      One-shot: push device names to hub displays
+  hub watch                     Daemon: continuously update hub on connect/disconnect
+  hub install                   Install hub agent as macOS LaunchAgent (auto-start)
+  hub uninstall                 Remove hub agent LaunchAgent
+  hub log                       Tail the hub agent log file
+
+Register options:
+  --port /dev/cu.*              Auto-detect serial number from port (via pyserial)
+  --mac AA:BB:CC:DD:EE:FF       Explicit MAC/serial number
+  --serial XXXX                 Same as --mac
+  --type TYPE                   Device type (default: esp32)
+  --chip CHIP                   Chip variant (default: esp32s3)
+  --hub-name NAME               Display name for Insight Hub (max 14 chars)
+
+Checkout options:
+  --wait                        Block until the device is available
+  --timeout N                   Give up after N seconds (with --wait)
+  --owner STR                   Who is checking out (default: user@host)
+  --purpose STR                 Why (shown in locks output)
+  --ttl N                       Auto-expire lock after N seconds (default: 1800)
+
+Chained commands (device name first, then one or more commands):
+  usb-device "1.9" reset bootloader    # power-cycle then enter bootloader
+
+Device names support fuzzy matching (exact, substring, or regex).
+USAGE
+}
+
 # ── Commands ──────────────────────────────────────────────────────
 
 cmd_check() {
@@ -965,12 +1052,24 @@ cmd_scan() {
             read -r hub port how <<< "$result"
             db_evict_port "$hub" "$port" "$name"
             db_put "$name" "$mac" "$hub" "$port" "$how" "${serial_port:--}"
-            printf "  %-30s  hub=%-6s port=%-4s dev=%-25s [found]\n" "$name" "$hub" "$port" "${serial_port:--}"
+            local mode_tag="found"
+            if [ "$type" = "insight_hub" ]; then
+                local mode
+                mode=$(detect_device_mode "$mac")
+                [ "$mode" = "bootloader" ] && mode_tag="found, BOOTLOADER"
+            fi
+            printf "  %-30s  hub=%-6s port=%-4s dev=%-25s [%s]\n" "$name" "$hub" "$port" "${serial_port:--}" "$mode_tag"
             found=$((found + 1))
             updated=$((updated + 1))
         elif [ -n "$serial_port" ]; then
+            local mode_tag="found, no power-switchable hub"
+            if [ "$type" = "insight_hub" ]; then
+                local mode
+                mode=$(detect_device_mode "$mac")
+                [ "$mode" = "bootloader" ] && mode_tag="found, BOOTLOADER, no power-switchable hub"
+            fi
             db_put "$name" "$mac" "-" "-" "no-hub" "${serial_port}"
-            printf "  %-30s  dev=%-25s [found, no power-switchable hub]\n" "$name" "$serial_port"
+            printf "  %-30s  dev=%-25s [%s]\n" "$name" "$serial_port" "$mode_tag"
             found=$((found + 1))
             updated=$((updated + 1))
         else
@@ -1103,6 +1202,27 @@ cmd_reset() {
     check_lock_warning "$RESOLVED_NAME"
     resolve_hub_port
 
+    # ── Step 0: insight_hub — use serial API (uhubctl can't power-cycle the on-board hub)
+    if [ "$RESOLVED_TYPE" = "insight_hub" ]; then
+        local mode
+        mode=$(detect_device_mode "$RESOLVED_MAC")
+        if [ "$mode" = "bootloader" ]; then
+            echo "Device is in ROM bootloader — clearing FORCE_DOWNLOAD_BOOT via esptool..."
+            RESOLVED_PORT=$(find_serial_port "$RESOLVED_MAC")
+            if [ -n "$RESOLVED_PORT" ]; then
+                dispatch_type_action "boot"
+                return $?
+            fi
+            echo "Bootloader port not found — falling through to power cycle" >&2
+        elif [ "$mode" = "app" ]; then
+            RESOLVED_PORT=$(find_serial_port "$RESOLVED_MAC")
+            if [ -n "$RESOLVED_PORT" ]; then
+                dispatch_type_action "restart"
+                return $?
+            fi
+        fi
+    fi
+
     # ── Step 1: Try port-level power cycle ────────────────────────
     local using_insight_hub=0
     if _is_insight_hub_device; then
@@ -1111,7 +1231,7 @@ cmd_reset() {
         _insight_hub_power cycle 2
     else
         echo "Resetting '$RESOLVED_NAME' on hub $HUB port $PORT..."
-        sudo uhubctl -a cycle -l "$HUB" -p "$PORT" 2>&1
+        sudo uhubctl -a cycle -d 2 -l "$HUB" -p "$PORT" 2>&1
     fi
 
     # Wait for device to re-enumerate
@@ -1188,6 +1308,33 @@ cmd_reset() {
         fi
         attempts=$((attempts + 1))
     done
+
+    # ── Step 3: Escalate to parent hub power cycle ─────────────────
+    local parent_hub="${HUB%.*}"
+    if [ "$parent_hub" != "$HUB" ] && [ -n "$parent_hub" ]; then
+        local child_port="${HUB##*.}"
+        echo ""
+        echo "Device did not come back after hub reset."
+        echo "Escalating to parent hub power cycle ($parent_hub port $child_port)..."
+        sudo uhubctl -a cycle -d 2 -l "$parent_hub" -p "$child_port" 2>&1
+
+        echo "Waiting for device to re-enumerate after parent hub reset..."
+        attempts=0
+        while [ $attempts -lt 15 ]; do
+            sleep 1
+            if device_is_alive "$RESOLVED_MAC"; then
+                echo "Device '$RESOLVED_NAME' is back online."
+                local new_result new_serial
+                new_serial=$(find_serial_port "$RESOLVED_MAC")
+                if new_result=$(find_hub_port_live "$RESOLVED_MAC"); then
+                    read -r new_hub new_port new_how <<< "$new_result"
+                    db_put "$RESOLVED_NAME" "$RESOLVED_MAC" "$new_hub" "$new_port" "$new_how" "${new_serial:--}"
+                fi
+                return 0
+            fi
+            attempts=$((attempts + 1))
+        done
+    fi
 
     echo "Device '$RESOLVED_NAME' did not come back after hub reset."
     return 1
@@ -1292,16 +1439,101 @@ cmd_hub() {
     esac
 }
 
+# ── Register ──────────────────────────────────────────────────────
+
+cmd_register() {
+    local name="" mac="" type="esp32" chip="esp32s3" hub_name="" port=""
+
+    # First positional arg is the device name
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --port)     port="$2"; shift 2 ;;
+            --mac|--serial) mac="$2"; shift 2 ;;
+            --type)     type="$2"; shift 2 ;;
+            --chip)     chip="$2"; shift 2 ;;
+            --hub-name) hub_name="$2"; shift 2 ;;
+            -*)         die "unknown flag: $1" ;;
+            *)
+                if [ -z "$name" ]; then
+                    name="$1"; shift
+                else
+                    die "unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    [ -n "$name" ] || die "usage: usb-device register <name> --port /dev/cu.* | --mac AA:BB:CC:DD:EE:FF [--type TYPE] [--chip CHIP] [--hub-name NAME]"
+
+    # Auto-detect from port
+    if [ -n "$port" ]; then
+        local detect_result
+        detect_result=$($PYTHON -c "
+from serial.tools.list_ports import comports
+port = '$port'
+for p in comports():
+    if p.device == port:
+        print((p.serial_number or '') + '\t' + (p.description or ''))
+        break
+" 2>/dev/null)
+        if [ -z "$detect_result" ]; then
+            die "no device found on port $port"
+        fi
+        local detected_serial detected_desc
+        detected_serial="${detect_result%%	*}"
+        detected_desc="${detect_result##*	}"
+        if [ -z "$detected_serial" ]; then
+            die "device on $port has no serial number — use --mac to specify manually"
+        fi
+        mac="$detected_serial"
+        echo "Detected: $detected_desc"
+        echo "Serial:   $mac"
+    fi
+
+    [ -n "$mac" ] || die "must specify --port or --mac"
+
+    # Check for duplicate name
+    parse_config
+    local i
+    for i in "${!DEVICE_NAMES[@]}"; do
+        if [ "${DEVICE_NAMES[$i]}" = "$name" ]; then
+            die "device '$name' is already registered (mac=${DEVICE_MACS[$i]})"
+        fi
+    done
+
+    # Create config dir if needed
+    mkdir -p "$(dirname "$CONF")"
+
+    # Append INI section
+    {
+        echo ""
+        echo "[$name]"
+        echo "mac=$mac"
+        echo "type=$type"
+        [ -n "$chip" ] && echo "chip=$chip"
+        [ -n "$hub_name" ] && echo "hub_name=$hub_name"
+    } >> "$CONF"
+
+    echo "Registered '$name' (mac=$mac, type=$type, chip=$chip)"
+
+    # Reset parser cache and scan
+    CONFIG_PARSED=0
+    echo ""
+    cmd_scan
+}
+
 # ── Main dispatch ─────────────────────────────────────────────────
 
 # Commands that don't take a device name
 case "${1:-}" in
-    version) echo "usb-device $USB_DEVICE_VERSION"; exit ;;
-    list)  cmd_list; exit ;;
-    scan)  cmd_scan; exit ;;
-    check) cmd_check; exit ;;
-    locks) cmd_locks; exit ;;
-    hub)   shift; cmd_hub "$@"; exit ;;
+    version)        echo "usb-device $USB_DEVICE_VERSION"; exit ;;
+    help|--help|-h) cmd_help; exit ;;
+    list)           cmd_list; exit ;;
+    scan)           cmd_scan; exit ;;
+    check)          cmd_check; exit ;;
+    locks)          cmd_locks; exit ;;
+    register)       shift; cmd_register "$@"; exit ;;
+    hub)            shift; cmd_hub "$@"; exit ;;
 esac
 
 # Dispatch a single command. If RESOLVED_NAME is already set, use it.
@@ -1333,45 +1565,7 @@ is_command() {
 }
 
 if [ -z "${1:-}" ]; then
-    cat <<'USAGE'
-usage: usb-device <command> [options] [device-name]
-       usb-device <device-name> <command> [command ...]
-
-Commands:
-  version                       Print version and exit
-  list                          Show all registered devices and their status
-  scan                          Scan USB bus and update last-known locations
-  check                         Verify all dependencies are installed
-  find <name>                   Show hub, port, serial device info
-  type <name>                   Print device type (for scripting)
-  reset [-f|--force] <name>     Power-cycle a device (escalates to hub if needed)
-  off <name>                    Turn off power to a device
-  on <name>                     Turn on power to a device
-  port <name>                   Print /dev/cu.* path
-  bootloader <name>             Enter bootloader (requires type plugin)
-  boot <name>                   Exit bootloader (requires type plugin)
-  checkout [opts] <name> [...]   Acquire exclusive access (multi-device: sorted, all-or-nothing)
-  checkin [-f] <name> [...]     Release exclusive access
-  locks                         Show all checked-out devices
-  hub status                    Show Insight Hub channels and device assignments
-  hub sync                      One-shot: push device names to hub displays
-  hub watch                     Daemon: continuously update hub on connect/disconnect
-  hub install                   Install hub agent as macOS LaunchAgent (auto-start)
-  hub uninstall                 Remove hub agent LaunchAgent
-  hub log                       Tail the hub agent log file
-
-Checkout options:
-  --wait                        Block until the device is available
-  --timeout N                   Give up after N seconds (with --wait)
-  --owner STR                   Who is checking out (default: user@host)
-  --purpose STR                 Why (shown in locks output)
-  --ttl N                       Auto-expire lock after N seconds (default: 1800)
-
-Chained commands (device name first, then one or more commands):
-  usb-device "1.9" reset bootloader    # power-cycle then enter bootloader
-
-Device names support fuzzy matching (exact, substring, or regex).
-USAGE
+    cmd_help
     exit 1
 fi
 
