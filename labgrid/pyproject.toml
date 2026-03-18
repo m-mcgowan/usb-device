@@ -13,6 +13,9 @@ dependencies = [
     "attrs>=21.0",
 ]
 
+[project.scripts]
+usb-device-exporter = "labgrid_usb_device.run_exporter:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
