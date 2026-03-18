@@ -35,15 +35,27 @@ cp exporter.yaml.example exporter.yaml
 ## Quick Start (manual)
 
 ```bash
+# Set coordinator address (also used by pio-labgrid clients)
+export LG_COORDINATOR=localhost:20408
+
 # Terminal 1: start coordinator
-labgrid-coordinator --listen ws://0.0.0.0:20408/ws
+labgrid-coordinator -l 0.0.0.0:20408
 
-# Terminal 2: start exporter
-labgrid-exporter --coordinator $LABGRID_COORDINATOR exporter.yaml
+# Terminal 2: start exporter (uses usb-device-exporter, not stock labgrid-exporter)
+python -m labgrid_usb_device.run_exporter -c $LG_COORDINATOR exporter.yaml
 
-# From any machine: verify
+# Terminal 3: create a place and match it to the exported resource group
+labgrid-client -p test-rig-1 create
+labgrid-client -p test-rig-1 add-match "*/test-rig-1/*"
+
+# Verify
 labgrid-client resources
+labgrid-client -p test-rig-1 show
 ```
+
+**Important:** labgrid requires places to be explicitly created and matched to
+resource groups. The exporter advertises resources; places give them a name that
+clients can reserve and acquire.
 
 ## Install as macOS launchd Services
 
@@ -117,11 +129,18 @@ The coordinator is a lightweight WAMP router. It holds no state — it brokers m
 
 ### Exporter
 
-The exporter advertises local devices to the coordinator. On macOS, it uses the `USBDeviceExport` bridge from `labgrid_usb_device` to discover devices via `usb-device` (since macOS lacks udev). On Linux, use labgrid's native udev-based resources instead.
+The exporter advertises local devices to the coordinator. Use
+`usb-device-exporter` (or `python -m labgrid_usb_device.run_exporter`) instead
+of the stock `labgrid-exporter`. This registers the `USBDevice` resource type
+with labgrid's export system so `exporter.yaml` can reference devices from
+`devices.conf`.
+
+On Linux, you can use the stock `labgrid-exporter` with native udev resources
+(see below), or use `usb-device-exporter` if `usb-device` is installed.
 
 - Connects to the coordinator on `localhost:20408` (assuming co-located)
-- Reads `devices.conf` for device metadata and partner discovery
-- Auto-restarts on crash
+- `USBDevice` resources are exported as passthrough (no ser2net or udev needed)
+- Auto-restarts on crash when run as a launchd service
 
 ### Linux Exporters
 
