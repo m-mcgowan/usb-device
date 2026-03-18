@@ -501,12 +501,11 @@ parse_static_location() {
 # These helpers detect Insight Hub devices and route power commands
 # through the serial API instead of uhubctl.
 
-# Detect Insight Hub and set INSIGHT_HUB_PORT and INSIGHT_HUB_LOCATION.
+# Detect Insight Hub and set INSIGHT_HUB_LOCATION.
 # Returns 0 if found, 1 if not.
 _insight_hub_detect() {
     local result
     result=$("$PYTHON" "$SCRIPT_DIR/insight_hub.py" detect 2>/dev/null) || return 1
-    INSIGHT_HUB_PORT="${result%%	*}"      # field before tab
     INSIGHT_HUB_LOCATION="${result##*	}"   # field after tab
     return 0
 }
@@ -1261,7 +1260,7 @@ cmd_reset() {
         # Renesas hub chip doesn't support uhubctl — retry via serial API
         # with a fresh connection (re-detect in case the port changed).
         echo "Retrying Insight Hub power cycle (fresh connection)..."
-        INSIGHT_HUB_PORT="" INSIGHT_HUB_LOCATION=""
+        INSIGHT_HUB_LOCATION=""
         if _insight_hub_detect && _is_insight_hub_device; then
             _insight_hub_power cycle 3
         else
