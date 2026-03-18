@@ -17,3 +17,6 @@ dependencies = [
 dev = [
     "pytest>=7.0",
 ]
+
+[tool.setuptools]
+packages = ["labgrid_usb_device"]
