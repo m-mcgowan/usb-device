@@ -4,19 +4,24 @@
 # Partners are auto-discovered from devices.conf.
 #
 # Run manually:
-#   export LABGRID_COORDINATOR=ws://localhost:20408/ws
-#   labgrid-exporter --coordinator $LABGRID_COORDINATOR exporter.yaml
+#   export LG_COORDINATOR=localhost:20408
+#   python -m labgrid_usb_device.run_exporter -c $LG_COORDINATOR exporter.yaml
 #
 # Or install as a macOS launchd service (see README.md).
 
 # Add one entry per device group. The device_name must match a section
 # in your devices.conf. Partners (e.g. [My Board:debugger]) are
 # auto-discovered.
+#
+# Place names should be descriptive: location-board-peripherals
+# Example: workshop-mpcb-1.10-ppk2-1
+#
+# Tags (fixture metadata) are defined separately in fixtures.yaml.
 
-# test-rig-1:
+# workshop-mpcb-1.10-ppk2-1:
 #   USBDevice:
 #     device_name: "My Board Rev A"
 #
-# test-rig-2:
+# lab-mpcb-1.9-standalone-1:
 #   USBDevice:
 #     device_name: "My Board Rev B"

@@ -23,6 +23,7 @@ COORDINATOR_PORT="${LABGRID_PORT:-20408}"
 COORDINATOR_ADDR="0.0.0.0:$COORDINATOR_PORT"
 LG_COORDINATOR="localhost:$COORDINATOR_PORT"
 EXPORTER_YAML="$SCRIPT_DIR/exporter.yaml"
+FIXTURES_YAML="$SCRIPT_DIR/fixtures.yaml"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -63,12 +64,23 @@ cmd_install() {
         info "exporter.yaml already exists"
     fi
 
+    # Create fixtures.yaml from template if needed
+    if [ ! -f "$FIXTURES_YAML" ]; then
+        if [ -f "$SCRIPT_DIR/fixtures.yaml.example" ]; then
+            cp "$SCRIPT_DIR/fixtures.yaml.example" "$FIXTURES_YAML"
+            info "Created fixtures.yaml from template — edit it with your fixture tags"
+        fi
+    else
+        info "fixtures.yaml already exists"
+    fi
+
     info "Install complete."
     info ""
     info "Next steps:"
     info "  1. Edit $EXPORTER_YAML with your device names"
-    info "  2. Run: $0 start"
-    info "  3. Run: $0 places"
+    info "  2. Edit $FIXTURES_YAML with fixture tags (optional)"
+    info "  3. Run: $0 start"
+    info "  4. Run: $0 places"
     info ""
     info "Or install as launchd services:"
     info "  $0 launchd-install"
@@ -192,8 +204,47 @@ if data:
         fi
     done <<< "$groups"
 
+    # Apply fixture tags from fixtures.yaml
+    _apply_tags
+
     echo ""
     labgrid_client places
+}
+
+_apply_tags() {
+    if [ ! -f "$FIXTURES_YAML" ]; then
+        return
+    fi
+
+    info "Applying fixture tags from fixtures.yaml..."
+
+    # Read fixtures.yaml and apply tags to each place
+    venv_python -c "
+import yaml, subprocess, sys, os
+
+coordinator = '$LG_COORDINATOR'
+lgclient = '$VENV_DIR/bin/labgrid-client'
+fixtures_path = '$FIXTURES_YAML'
+
+with open(fixtures_path) as f:
+    fixtures = yaml.safe_load(f)
+
+if not fixtures:
+    sys.exit(0)
+
+for place_name, tags in fixtures.items():
+    if not isinstance(tags, dict) or not tags:
+        continue
+    # Build tag args: key=value key=value ...
+    tag_args = [f'{k}={v}' for k, v in tags.items()]
+    cmd = [lgclient, '-x', coordinator, '-p', place_name, 'set-tags'] + tag_args
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f'[setup] Tags set for {place_name}: {\" \".join(tag_args)}')
+    else:
+        err = result.stderr.strip() or result.stdout.strip()
+        print(f'[setup] WARNING: Failed to set tags for {place_name}: {err}', file=sys.stderr)
+"
 }
 
 # ── launchd ──────────────────────────────────────────────────────────────────

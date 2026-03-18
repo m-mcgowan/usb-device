@@ -85,21 +85,54 @@ export LABGRID_COORDINATOR=$LG_COORDINATOR
 ## Exporter Configuration
 
 `exporter.yaml` defines resource groups. Each group name becomes a labgrid
-place. The `USBDevice` resource type references a device by its name in
-`devices.conf`:
+place. Use descriptive names: `location-board-peripherals`.
 
 ```yaml
-test-rig-1:
+workshop-mpcb-1.10-ppk2-1:
   USBDevice:
-    device_name: "My Board Rev A"
+    device_name: "MPCB 1.10 Development"
 
-test-rig-2:
+lab-mpcb-1.9-standalone-1:
   USBDevice:
-    device_name: "My Board Rev B"
+    device_name: "MPCB 1.9 Development"
 ```
 
 The file is gitignored — create it from `exporter.yaml.example` and customize
 for your local devices. `setup.sh install` copies the template automatically.
+
+## Fixture Metadata (Tags)
+
+`fixtures.yaml` defines tags for each place. Tags describe the physical test
+environment — things the firmware can't detect on its own. Clients can filter
+places by tag (e.g. "give me a board with GPS sky access").
+
+```yaml
+workshop-mpcb-1.10-ppk2-1:
+  board: mpcb-1.10
+  chip: esp32s3
+  gps_sky_access: "true"
+  rfid_tag_id: "141041190395"
+  rfid_has_temperature: "true"
+  battery_connected: "false"
+  power_source: ppk2
+  power_source_mv: "3700"
+```
+
+Tags are applied to places by `setup.sh places` (or automatically during
+`setup.sh start`). They're visible in `labgrid-client -p NAME show` and can
+be used for filtering:
+
+```bash
+# Find places with GPS sky access
+labgrid-client places --tag gps_sky_access=true
+
+# Reserve any board with a specific capability
+labgrid-client reserve board=mpcb-1.10 gps_sky_access=true
+```
+
+The file is gitignored — create it from `fixtures.yaml.example`. This replaces
+the `~/.config/test-fixtures/*.json` files with centralized, coordinator-managed
+metadata.
 
 ### Why usb-device-exporter?
 
@@ -119,16 +152,23 @@ For each group in `exporter.yaml`, the script creates a place with the same
 name and a wildcard match:
 
 ```
-labgrid-client -p test-rig-1 create
-labgrid-client -p test-rig-1 add-match "*/test-rig-1/*"
+labgrid-client -p workshop-mpcb-1.10-ppk2-1 create
+labgrid-client -p workshop-mpcb-1.10-ppk2-1 add-match "*/workshop-mpcb-1.10-ppk2-1/*"
+labgrid-client -p workshop-mpcb-1.10-ppk2-1 set-tags board=mpcb-1.10 gps_sky_access=true ...
 ```
 
 Clients reserve and acquire places by name:
 
 ```bash
-labgrid-client -p test-rig-1 acquire
+labgrid-client -p workshop-mpcb-1.10-ppk2-1 acquire
 # ... use the device ...
-labgrid-client -p test-rig-1 release
+labgrid-client -p workshop-mpcb-1.10-ppk2-1 release
+```
+
+Or by capability (tag matching):
+
+```bash
+labgrid-client reserve board=mpcb-1.10 gps_sky_access=true --wait
 ```
 
 ## Adding Devices
@@ -140,18 +180,22 @@ labgrid-client -p test-rig-1 release
 
 2. Add a group to `exporter.yaml`:
    ```yaml
-   new-rig:
+   lab-myboard-1:
      USBDevice:
        device_name: "My New Board"
    ```
 
-3. Restart the exporter and create the place:
+3. Add fixture tags to `fixtures.yaml` (optional):
+   ```yaml
+   lab-myboard-1:
+     board: myboard
+     chip: esp32s3
+     gps_sky_access: "true"
+   ```
+
+4. Restart and apply:
    ```bash
    ./setup.sh stop && ./setup.sh start
-   # or if using launchd:
-   launchctl unload ~/Library/LaunchAgents/com.usb-device.labgrid-exporter.plist
-   launchctl load ~/Library/LaunchAgents/com.usb-device.labgrid-exporter.plist
-   ./setup.sh places
    ```
 
 ## Logs

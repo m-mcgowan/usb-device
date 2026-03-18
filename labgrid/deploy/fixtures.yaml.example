@@ -1,0 +1,21 @@
+# Fixture metadata for labgrid places.
+#
+# Tags describe the physical test environment — things the firmware can't
+# detect on its own. These are set on labgrid places so clients can filter
+# by capability (e.g. "give me a board with GPS sky access").
+#
+# Each top-level key must match a group name in exporter.yaml.
+# Tags are flat key=value pairs (labgrid place tags).
+#
+# setup.sh reads this file and applies tags via:
+#   labgrid-client -p PLACE set-tags key1=value1 key2=value2 ...
+
+# workshop-mpcb-1.10-ppk2-1:
+#   board: mpcb-1.10
+#   chip: esp32s3
+#   gps_sky_access: "true"
+#   rfid_tag_id: "141041190395"
+#   rfid_has_temperature: "true"
+#   battery_connected: "false"
+#   power_source: ppk2
+#   power_source_mv: "3700"
