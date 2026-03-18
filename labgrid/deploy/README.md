@@ -1,156 +1,181 @@
 # labgrid Coordinator & Exporter Deployment
 
-Deploy a labgrid coordinator and exporter for shared hardware reservation across local developers and CI.
+Deploy a labgrid coordinator and exporter for shared hardware reservation
+across local developers and CI.
 
-## Prerequisites
+## Architecture
+
+```
+Coordinator (gRPC, port 20408)
+    |
+    +-- Exporter (usb-device-exporter)
+    |     Reads exporter.yaml, exports USBDevice resources
+    |     from devices.conf to the coordinator
+    |
+    +-- Clients (labgrid-client, pio-labgrid)
+          Reserve and acquire places to get exclusive
+          access to devices
+```
+
+**Coordinator** — lightweight gRPC router. Holds place definitions and brokers
+resource access between exporters and clients. Stateless (places are recreated
+on startup by the setup script).
+
+**Exporter** — runs on each machine with physical devices. Uses
+`usb-device-exporter` (`python -m labgrid_usb_device.run_exporter`) instead of
+the stock `labgrid-exporter`. This registers the `USBDevice` resource type so
+`exporter.yaml` can reference devices from `devices.conf`.
+
+**Places** — named reservation targets. Each place matches one or more resource
+groups from the exporter. Places must be explicitly created and matched.
+
+## Quick Start
 
 ```bash
-# Install labgrid (coordinator + client + exporter)
-pip install labgrid
+cd path/to/usb-device/labgrid/deploy
 
-# Install the usb-device labgrid bridge (macOS USB discovery)
-pip install -e path/to/usb-device/labgrid
+# Install dependencies (creates venv, installs labgrid + bridge)
+./setup.sh install
+
+# Edit exporter.yaml with your device names from devices.conf
+vim exporter.yaml
+
+# Start coordinator + exporter, create places
+./setup.sh start
+
+# Verify
+./setup.sh status
 ```
+
+## Setup Script
+
+`setup.sh` handles the full lifecycle:
+
+| Command | Description |
+|---------|-------------|
+| `./setup.sh install` | Create venv, install labgrid + bridge, create exporter.yaml from template |
+| `./setup.sh start` | Start coordinator + exporter, create places |
+| `./setup.sh stop` | Stop coordinator + exporter |
+| `./setup.sh status` | Show running processes, resources, and places |
+| `./setup.sh places` | Create/update places from exporter.yaml |
+| `./setup.sh launchd-install` | Install macOS launchd services (auto-start on login) |
+| `./setup.sh launchd-uninstall` | Remove launchd services |
 
 ## Environment Variables
 
-The same `LABGRID_COORDINATOR` variable used by `pio-labgrid` clients also configures the exporter and CLI tools:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LG_COORDINATOR` | `localhost:20408` | Coordinator address (labgrid's native env var) |
+| `LABGRID_COORDINATOR` | (none) | Used by `pio-labgrid` clients |
+| `LABGRID_PORT` | `20408` | Override coordinator port in setup.sh |
+
+labgrid 25.x uses `LG_COORDINATOR` as the default for `-x`/`-c` flags. Set
+this in your shell profile so `labgrid-client` commands work without `-x`:
 
 ```bash
-# Set once in your shell profile
-export LABGRID_COORDINATOR=ws://COORDINATOR_HOST:20408/ws
+export LG_COORDINATOR=your-coordinator-host:20408
 ```
 
-## Setup
-
-Create your local exporter config from the template:
+For `pio-labgrid` clients, also set:
 
 ```bash
-cp exporter.yaml.example exporter.yaml
-# Edit exporter.yaml with your device names (from devices.conf)
+export LABGRID_COORDINATOR=$LG_COORDINATOR
 ```
 
-`exporter.yaml` is gitignored so local config won't be overwritten by pulls.
+## Exporter Configuration
 
-## Quick Start (manual)
+`exporter.yaml` defines resource groups. Each group name becomes a labgrid
+place. The `USBDevice` resource type references a device by its name in
+`devices.conf`:
 
-```bash
-# Set coordinator address (also used by pio-labgrid clients)
-export LG_COORDINATOR=localhost:20408
+```yaml
+test-rig-1:
+  USBDevice:
+    device_name: "My Board Rev A"
 
-# Terminal 1: start coordinator
-labgrid-coordinator -l 0.0.0.0:20408
+test-rig-2:
+  USBDevice:
+    device_name: "My Board Rev B"
+```
 
-# Terminal 2: start exporter (uses usb-device-exporter, not stock labgrid-exporter)
-python -m labgrid_usb_device.run_exporter -c $LG_COORDINATOR exporter.yaml
+The file is gitignored — create it from `exporter.yaml.example` and customize
+for your local devices. `setup.sh install` copies the template automatically.
 
-# Terminal 3: create a place and match it to the exported resource group
+### Why usb-device-exporter?
+
+The stock `labgrid-exporter` only handles built-in resource types (udev-backed
+USB devices, serial ports via ser2net, etc.). `USBDevice` is a custom resource
+type that represents a device managed by the `usb-device` tool.
+
+`usb-device-exporter` is a thin wrapper (~10 lines) that registers `USBDevice`
+in labgrid's export registry as a passthrough resource, then delegates to
+labgrid's standard exporter. No ser2net or udev is needed — the resource is
+exported as-is with its `device_name` parameter.
+
+### Places and Matching
+
+Places are created automatically by `setup.sh start` or `setup.sh places`.
+For each group in `exporter.yaml`, the script creates a place with the same
+name and a wildcard match:
+
+```
 labgrid-client -p test-rig-1 create
 labgrid-client -p test-rig-1 add-match "*/test-rig-1/*"
-
-# Verify
-labgrid-client resources
-labgrid-client -p test-rig-1 show
 ```
 
-**Important:** labgrid requires places to be explicitly created and matched to
-resource groups. The exporter advertises resources; places give them a name that
-clients can reserve and acquire.
-
-## Install as macOS launchd Services
-
-The `.plist` files are templates. Edit them to set correct paths before installing.
+Clients reserve and acquire places by name:
 
 ```bash
-# Edit exporter.plist — update the exporter.yaml path and WorkingDirectory
-vim exporter.plist
-
-# Copy plists to LaunchAgents
-cp coordinator.plist ~/Library/LaunchAgents/com.usb-device.labgrid-coordinator.plist
-cp exporter.plist ~/Library/LaunchAgents/com.usb-device.labgrid-exporter.plist
-
-# Load services (start immediately and on login)
-launchctl load ~/Library/LaunchAgents/com.usb-device.labgrid-coordinator.plist
-launchctl load ~/Library/LaunchAgents/com.usb-device.labgrid-exporter.plist
-```
-
-## Verify
-
-From any machine that can reach the coordinator (e.g. via VPN or local network):
-
-```bash
-# List exported resources
-labgrid-client resources
-
-# List places
-labgrid-client places
-
-# Show reservations
-labgrid-client reservations
-```
-
-## Managing Services
-
-```bash
-# Stop
-launchctl unload ~/Library/LaunchAgents/com.usb-device.labgrid-coordinator.plist
-launchctl unload ~/Library/LaunchAgents/com.usb-device.labgrid-exporter.plist
-
-# View logs
-tail -f /tmp/labgrid-coordinator.log
-tail -f /tmp/labgrid-exporter.log
-
-# Restart (unload + load)
-launchctl unload ~/Library/LaunchAgents/com.usb-device.labgrid-exporter.plist
-launchctl load ~/Library/LaunchAgents/com.usb-device.labgrid-exporter.plist
+labgrid-client -p test-rig-1 acquire
+# ... use the device ...
+labgrid-client -p test-rig-1 release
 ```
 
 ## Adding Devices
 
-Edit `exporter.yaml` to add new device places. The exporter reads `devices.conf` to auto-discover each device and its partners (e.g. notecard, power profiler).
+1. Register the device with `usb-device`:
+   ```bash
+   usb-device register "My New Board" --mac AA:BB:CC:DD:EE:FF --type esp32
+   ```
 
-```yaml
-my-new-rig:
-  USBDevice:
-    device_name: "My Device Name"
+2. Add a group to `exporter.yaml`:
+   ```yaml
+   new-rig:
+     USBDevice:
+       device_name: "My New Board"
+   ```
+
+3. Restart the exporter and create the place:
+   ```bash
+   ./setup.sh stop && ./setup.sh start
+   # or if using launchd:
+   launchctl unload ~/Library/LaunchAgents/com.usb-device.labgrid-exporter.plist
+   launchctl load ~/Library/LaunchAgents/com.usb-device.labgrid-exporter.plist
+   ./setup.sh places
+   ```
+
+## Logs
+
+```bash
+tail -f /tmp/labgrid-coordinator.log
+tail -f /tmp/labgrid-exporter.log
 ```
 
-Then restart the exporter service.
+## Linux Exporters
 
-## Configuration
+For Linux machines (e.g. SBCs), you can either:
 
-### Coordinator
-
-The coordinator is a lightweight WAMP router. It holds no state — it brokers messages between exporters and clients. Default port is 20408.
-
-- Listens on `0.0.0.0` so it's reachable from other machines
-- Auto-restarts on crash (`KeepAlive: true`)
-- Logs to `/tmp/labgrid-coordinator.log`
-
-### Exporter
-
-The exporter advertises local devices to the coordinator. Use
-`usb-device-exporter` (or `python -m labgrid_usb_device.run_exporter`) instead
-of the stock `labgrid-exporter`. This registers the `USBDevice` resource type
-with labgrid's export system so `exporter.yaml` can reference devices from
-`devices.conf`.
-
-On Linux, you can use the stock `labgrid-exporter` with native udev resources
-(see below), or use `usb-device-exporter` if `usb-device` is installed.
-
-- Connects to the coordinator on `localhost:20408` (assuming co-located)
-- `USBDevice` resources are exported as passthrough (no ser2net or udev needed)
-- Auto-restarts on crash when run as a launchd service
-
-### Linux Exporters
-
-For Linux machines (e.g. SBCs), use labgrid's native resources in `exporter.yaml`:
+1. Install `usb-device` + bridge and use the same setup (recommended for
+   consistency)
+2. Use the stock `labgrid-exporter` with native udev resources:
 
 ```yaml
 my-linux-rig:
   USBSerialPort:
     match:
       ID_SERIAL_SHORT: "ABC123"
+    speed: 115200
 ```
 
-No bridge package needed — labgrid handles udev natively.
+Both approaches register resources with the same coordinator. Clients don't
+need to know which exporter type is used.
