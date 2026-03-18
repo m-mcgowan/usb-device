@@ -16,7 +16,7 @@ If you work with multiple USB dev boards, you know the pain:
 
 ## Features
 
-- **Named devices** — fuzzy matching so `"1.9"` finds `"MPCB 1.9 Development"`
+- **Named devices** — fuzzy matching so `"Rev-A"` finds `"Board Rev-A"`
 - **Persistent tracking** — `scan` remembers where devices were, so commands work even when boards are sleeping or disconnected
 - **Power control** — `reset`, `on`, `off` with automatic port-to-hub escalation
 - **Type plugins** — board-specific commands (bootloader, boot) via extensible shell plugins
@@ -182,10 +182,10 @@ The agent auto-detects the hub, reconnects if it's unplugged and replugged, and 
 By default the device name from `devices.conf` is truncated to 14 chars. Override with `hub_name=`:
 
 ```ini
-[MPCB 1.9 Development]
+[Board Rev-A]
 mac=B8:F8:62:D2:2A:FC
 type=esp32
-hub_name=1.9 Dev
+hub_name=Rev-A Dev
 ```
 
 #### Manual hub config
@@ -280,7 +280,7 @@ My Device=B8:F8:62:D2:2A:FC
 INI-style sections with explicit type:
 
 ```ini
-[MPCB 1.9 Development]
+[Board Rev-A]
 mac=B8:F8:62:D2:2A:FC
 type=esp32
 chip=esp32s3
@@ -315,7 +315,7 @@ All types support the core commands: find, type, port, reset, on, off, checkout,
 | `serial=` | Non-ESP32 devices (pyserial serial_number) | `C9F6358AC307` |
 | `location=` | Dumb USB power ports with no serial identity | `20-2.3` |
 | `chip=` | Board variant (passed to type plugin) | `esp32s3`, `esp32c3` |
-| `hub_name=` | Display name on Insight Hub (max 14 chars) | `1.9 Dev` |
+| `hub_name=` | Display name on Insight Hub (max 14 chars) | `Rev-A Dev` |
 
 `mac` and `serial` are synonyms — both match against pyserial's `serial_number` field.
 

@@ -110,7 +110,7 @@ The hub supports a special text mode (`numDev=10`) with up to 3 lines of 14 char
 ```json
 {"action":"set","params":{"CH1":{
   "Dev1_name":{
-    "T1":{"txt":"MPCB 1.9 Devel","color":"GREEN"},
+    "T1":{"txt":"Board Rev-A","color":"GREEN"},
     "T2":{"txt":"bootloader","color":"ORANGE"}
   },
   "numDev":"10","usbType":"2"

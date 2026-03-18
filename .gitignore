@@ -3,3 +3,4 @@ __pycache__/
 
 # Local deployment config (copy from .example and edit)
 labgrid/deploy/exporter.yaml
+.claude/

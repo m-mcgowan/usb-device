@@ -1,0 +1,25 @@
+# Example labgrid exporter configuration for usb-device.
+#
+# The exporter reads devices.conf to auto-discover the device and all
+# its partners. You only specify the primary device name here.
+#
+# Run with: labgrid-exporter exporter.yaml
+
+# A test rig with a board and its partners (notecard, ppk2).
+# Partners are auto-discovered from devices.conf sections like:
+#   [Board Rev-B]
+#   [Board Rev-B:notecard]
+#   [Board Rev-B:ppk2]
+test-rig-1:
+  USBDevice:
+    device_name: "Board Rev-B"
+    # Optional lifecycle scripts:
+    # setup_script: /path/to/setup.sh
+    # teardown_script: /path/to/teardown.sh
+
+# Native labgrid resources can coexist alongside usb-device resources.
+# These are managed directly by labgrid, not by usb-device.
+#
+# test-rig-1-gpio:
+#   SysfsGPIO:
+#     index: 17

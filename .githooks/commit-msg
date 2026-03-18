@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# commit-msg hook: reformat the commit message using reformat-commit-msg.
+# Installed by: reformat-commits/setup-hooks.sh
+set -euo pipefail
+
+REFORMAT_CMD="reformat-commit-msg"
+if ! command -v "$REFORMAT_CMD" &>/dev/null; then
+    exit 0  # silently skip if tool not installed
+fi
+
+MSG_FILE="$1"
+ORIGINAL=$(cat "$MSG_FILE")
+REFORMATTED=$(printf '%s' "$ORIGINAL" | "$REFORMAT_CMD")
+
+if [[ "$ORIGINAL" != "$REFORMATTED" ]]; then
+    printf '%s' "$REFORMATTED" > "$MSG_FILE"
+fi

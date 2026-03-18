@@ -22,14 +22,14 @@
 # Examples:
 
 # Flat format (backward compatible, type=generic):
-# MPCB 1.9 Development=B8:F8:62:D2:2A:FC
+# Board Rev-A=B8:F8:62:D2:2A:FC
 
 # ESP32 board with explicit type, chip, and Insight Hub display name:
-# [MPCB 1.9 Development]
+# [Board Rev-A]
 # mac=B8:F8:62:D2:2A:FC
 # type=esp32
 # chip=esp32s3
-# hub_name=1.9 Dev          # optional, max 14 chars, shown on Insight Hub display
+# hub_name=Rev-A Dev        # optional, max 14 chars, shown on Insight Hub display
 
 # PPK2 power profiler (Nordic serial number):
 # [PPK2 Dev]

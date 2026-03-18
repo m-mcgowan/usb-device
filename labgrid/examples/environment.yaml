@@ -1,0 +1,28 @@
+# Example labgrid client environment for usb-device resources.
+#
+# This configures a local test target (no coordinator needed).
+# For remote/coordinated setups, use labgrid-client with places instead.
+#
+# Usage:
+#   pytest --lg-env environment.yaml
+
+targets:
+  test-rig:
+    resources:
+      # Primary board — the ESP32 host serial port
+      - USBDevice:
+          device_name: "Board Rev-B"
+          device_type: esp32
+          extra:
+            chip: esp32s3
+
+      - SerialPort:
+          port: "/dev/cu.usbmodem1433101"
+          speed: 115200
+
+    drivers:
+      # Power control via usb-device on/off/reset
+      - USBDevicePowerDriver: {}
+
+      # labgrid's built-in serial driver binds to SerialPort
+      - SerialDriver: {}
