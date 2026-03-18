@@ -11,7 +11,7 @@ identity, metadata, and power control bindings.
 from __future__ import annotations
 
 import attr
-from labgrid.resource import Resource, NetworkResource
+from labgrid.resource import Resource
 from labgrid.factory import target_factory
 
 
@@ -23,6 +23,9 @@ class USBDevice(Resource):
     Represents a single device entry from devices.conf (either a primary
     device or a partner). For composite fixtures, the labgrid place groups
     multiple USBDevice + SerialPort resources together.
+
+    When exported via the coordinator, labgrid automatically wraps this as
+    a ``NetworkUSBDevice`` on the client side.
 
     Attributes:
         device_name: Full name in devices.conf (e.g. "Board Rev-A"
@@ -46,23 +49,3 @@ class USBDevice(Resource):
         super().__attrs_post_init__()
         if self.group_name is None:
             self.group_name = self.device_name
-
-
-@target_factory.reg_resource
-@attr.s(eq=False)
-class NetworkUSBDevice(NetworkResource):
-    """Remote USBDevice exported over the labgrid coordinator.
-
-    Mirrors USBDevice attributes for network access. The exporter creates
-    local USBDevice instances; the coordinator distributes them as
-    NetworkUSBDevice to clients.
-    """
-
-    device_name = attr.ib(validator=attr.validators.instance_of(str))
-    device_type = attr.ib(default="generic")
-    group_name = attr.ib(default=None)
-    role = attr.ib(default=None)
-    extra = attr.ib(factory=dict)
-    # Serial port info (if this device has a serial port)
-    port = attr.ib(default=None)
-    speed = attr.ib(default=115200)

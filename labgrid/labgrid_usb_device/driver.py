@@ -16,7 +16,7 @@ from labgrid.driver import Driver
 from labgrid.protocol import PowerProtocol
 from labgrid.factory import target_factory
 
-from .resource import USBDevice, NetworkUSBDevice
+from .resource import USBDevice
 
 logger = logging.getLogger(__name__)
 
@@ -39,52 +39,26 @@ def _run_usb_device(
 class USBDevicePowerDriver(Driver, PowerProtocol):
     """Power control for usb-device managed hardware.
 
-    Binds to a USBDevice or NetworkUSBDevice resource and calls
-    usb-device on/off/reset for power control.
-
-    For remote devices (NetworkUSBDevice), commands are executed via
-    the resource's command_prefix (typically SSH).
+    Binds to a USBDevice resource and calls usb-device on/off/reset
+    for power control.
     """
 
-    bindings = {"device": {"USBDevice", "NetworkUSBDevice"}}
-
-    def _get_prefix(self) -> list[str] | None:
-        """Get SSH command prefix for remote devices."""
-        if isinstance(self.device, NetworkUSBDevice):
-            host = self.device.host
-            if host:
-                return ["ssh", "-x", host]
-        return None
+    bindings = {"device": {"USBDevice"}}
 
     @Driver.check_active
     def on(self):
         """Power on the device."""
         logger.info("Powering on: %s", self.device.device_name)
-        _run_usb_device(
-            "on",
-            self.device.device_name,
-            command_prefix=self._get_prefix(),
-            check=False,
-        )
+        _run_usb_device("on", self.device.device_name, check=False)
 
     @Driver.check_active
     def off(self):
         """Power off the device."""
         logger.info("Powering off: %s", self.device.device_name)
-        _run_usb_device(
-            "off",
-            self.device.device_name,
-            command_prefix=self._get_prefix(),
-            check=False,
-        )
+        _run_usb_device("off", self.device.device_name, check=False)
 
     @Driver.check_active
     def cycle(self):
         """Power cycle the device."""
         logger.info("Power cycling: %s", self.device.device_name)
-        _run_usb_device(
-            "reset",
-            self.device.device_name,
-            command_prefix=self._get_prefix(),
-            check=False,
-        )
+        _run_usb_device("reset", self.device.device_name, check=False)
