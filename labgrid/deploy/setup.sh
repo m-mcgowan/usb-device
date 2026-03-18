@@ -92,7 +92,7 @@ cmd_start() {
     info "Coordinator started (PID $(cat /tmp/labgrid-coordinator.pid))"
 
     info "Starting exporter..."
-    nohup venv_python -m labgrid_usb_device.run_exporter \
+    nohup "$VENV_DIR/bin/python" -m labgrid_usb_device.run_exporter \
         -c "$LG_COORDINATOR" "$EXPORTER_YAML" \
         > /tmp/labgrid-exporter.log 2>&1 &
     echo $! > /tmp/labgrid-exporter.pid
