@@ -1,2 +1,5 @@
 __pycache__/
 .venv/
+
+# Local deployment config (copy from .example and edit)
+labgrid/deploy/exporter.yaml

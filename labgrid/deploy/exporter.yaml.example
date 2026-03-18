@@ -1,0 +1,22 @@
+# labgrid exporter configuration for usb-device managed hardware.
+#
+# Each entry creates a labgrid "place" backed by a usb-device group.
+# Partners are auto-discovered from devices.conf.
+#
+# Run manually:
+#   export LABGRID_COORDINATOR=ws://localhost:20408/ws
+#   labgrid-exporter --coordinator $LABGRID_COORDINATOR exporter.yaml
+#
+# Or install as a macOS launchd service (see README.md).
+
+# Add one entry per device group. The device_name must match a section
+# in your devices.conf. Partners (e.g. [My Board:debugger]) are
+# auto-discovered.
+
+# test-rig-1:
+#   USBDevice:
+#     device_name: "My Board Rev A"
+#
+# test-rig-2:
+#   USBDevice:
+#     device_name: "My Board Rev B"

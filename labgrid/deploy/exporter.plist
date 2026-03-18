@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  labgrid exporter launchd service.
+
+  Before installing, update the paths below to match your environment:
+    - ProgramArguments: path to exporter.yaml
+    - WorkingDirectory: directory containing exporter.yaml
+    - HOME: your home directory
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.usb-device.labgrid-exporter</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/labgrid-exporter</string>
+        <string>--coordinator</string>
+        <string>ws://localhost:20408/ws</string>
+        <!-- Update: path to your exporter.yaml (copied from exporter.yaml.example) -->
+        <string>/path/to/deploy/exporter.yaml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/labgrid-exporter.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/labgrid-exporter.log</string>
+
+    <!-- Update to the directory containing exporter.yaml -->
+    <key>WorkingDirectory</key>
+    <string>/path/to/deploy</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <!-- Set LABGRID_COORDINATOR if the coordinator is on a different host -->
+        <key>LABGRID_COORDINATOR</key>
+        <string>ws://localhost:20408/ws</string>
+    </dict>
+</dict>
+</plist>
