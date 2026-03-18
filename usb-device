@@ -1111,7 +1111,7 @@ cmd_list() {
                 power_state="[power on]"
                 uhubctl -l "$hub" -p "$port" 2>/dev/null | grep -q "off" && power_state="[power off]"
             fi
-            printf "  %-30s  type=%-6s location=%-10s %s\n" "$name" "$type" "$location" "$power_state"
+            printf "  %-30s  type=%-11s location=%-10s %s\n" "$name" "$type" "$location" "$power_state"
             continue
         fi
 
@@ -1122,21 +1122,21 @@ cmd_list() {
             read -r hub port how <<< "$result"
             local label="[connected]"
             [ "$how" = "indirect" ] && label="[connected via sub-hub]"
-            printf "  %-30s  type=%-6s id=%-20s  hub=%-6s port=%-4s dev=%-25s %s\n" "$name" "$type" "$mac" "$hub" "$port" "${serial_port:--}" "$label"
+            printf "  %-30s  type=%-11s id=%-20s hub=%-6s port=%-4s dev=%-25s %s\n" "$name" "$type" "$mac" "$hub" "$port" "${serial_port:--}" "$label"
         elif [ -n "$serial_port" ]; then
-            printf "  %-30s  type=%-6s id=%-20s  dev=%-25s %s\n" "$name" "$type" "$mac" "$serial_port" "[connected, no power-switchable hub]"
+            printf "  %-30s  type=%-11s id=%-20s dev=%-25s %s\n" "$name" "$type" "$mac" "$serial_port" "[connected, no power-switchable hub]"
         else
             local db_hub db_port db_ts
             db_hub=$(db_get "$name" "hub")
             db_port=$(db_get "$name" "port")
             db_ts=$(db_get "$name" "last_seen")
             if [ -n "$db_hub" ] && [ "$db_hub" != "-" ]; then
-                printf "  %-30s  type=%-6s id=%-20s  hub=%-6s port=%-4s dev=%-25s [offline, last seen %s]\n" \
+                printf "  %-30s  type=%-11s id=%-20s hub=%-6s port=%-4s dev=%-25s [offline, last seen %s]\n" \
                     "$name" "$type" "$mac" "$db_hub" "$db_port" "-" "$db_ts"
             elif [ -n "$db_ts" ]; then
-                printf "  %-30s  type=%-6s id=%-20s  %s\n" "$name" "$type" "$mac" "[offline, last seen $db_ts]"
+                printf "  %-30s  type=%-11s id=%-20s %s\n" "$name" "$type" "$mac" "[offline, last seen $db_ts]"
             else
-                printf "  %-30s  type=%-6s id=%-20s  %s\n" "$name" "$type" "$mac" "[not found]"
+                printf "  %-30s  type=%-11s id=%-20s %s\n" "$name" "$type" "$mac" "[not found]"
             fi
         fi
     done
@@ -1256,41 +1256,53 @@ cmd_reset() {
     echo ""
     echo "Device did not come back after port-level reset."
 
-    # ── Step 2: Escalate to hub-level power cycle ─────────────────
-    echo "Escalating to hub-level power cycle (hub $HUB)..."
-
-    # Find other known devices on this hub
-    local other_devices
-    other_devices=$(db_devices_on_hub "$HUB" "$PORT")
-
-    if [ -n "$other_devices" ]; then
-        echo ""
-        echo "WARNING: The following devices are also on hub $HUB and will be power-cycled:"
-        while IFS='|' read -r dev_name dev_port; do
-            echo "  - $dev_name (port $dev_port)"
-        done <<< "$other_devices"
-        echo ""
-
-        if [ "$force" -eq 0 ]; then
-            if [ -t 0 ]; then
-                printf "Continue with hub reset? [y/N] "
-                local answer
-                read -r answer
-                case "$answer" in
-                    [yY]|[yY][eE][sS]) ;;
-                    *) echo "Aborted."; exit 1 ;;
-                esac
-            else
-                echo "Non-interactive mode and --force not set. Aborting hub reset."
-                exit 1
-            fi
+    # ── Step 2: Escalate ──────────────────────────────────────────
+    if [ "$using_insight_hub" -eq 1 ]; then
+        # Renesas hub chip doesn't support uhubctl — retry via serial API
+        # with a fresh connection (re-detect in case the port changed).
+        echo "Retrying Insight Hub power cycle (fresh connection)..."
+        INSIGHT_HUB_PORT="" INSIGHT_HUB_LOCATION=""
+        if _insight_hub_detect && _is_insight_hub_device; then
+            _insight_hub_power cycle 3
         else
-            echo "(--force: proceeding without confirmation)"
+            echo "Could not re-detect Insight Hub for retry." >&2
         fi
-    fi
+    else
+        echo "Escalating to hub-level power cycle (hub $HUB)..."
 
-    # Cycle all ports on the hub
-    sudo uhubctl -a cycle -l "$HUB" 2>&1
+        # Find other known devices on this hub
+        local other_devices
+        other_devices=$(db_devices_on_hub "$HUB" "$PORT")
+
+        if [ -n "$other_devices" ]; then
+            echo ""
+            echo "WARNING: The following devices are also on hub $HUB and will be power-cycled:"
+            while IFS='|' read -r dev_name dev_port; do
+                echo "  - $dev_name (port $dev_port)"
+            done <<< "$other_devices"
+            echo ""
+
+            if [ "$force" -eq 0 ]; then
+                if [ -t 0 ]; then
+                    printf "Continue with hub reset? [y/N] "
+                    local answer
+                    read -r answer
+                    case "$answer" in
+                        [yY]|[yY][eE][sS]) ;;
+                        *) echo "Aborted."; exit 1 ;;
+                    esac
+                else
+                    echo "Non-interactive mode and --force not set. Aborting hub reset."
+                    exit 1
+                fi
+            else
+                echo "(--force: proceeding without confirmation)"
+            fi
+        fi
+
+        # Cycle all ports on the hub
+        sudo uhubctl -a cycle -l "$HUB" 2>&1
+    fi
 
     echo "Waiting for device to re-enumerate after hub reset..."
     attempts=0

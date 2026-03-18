@@ -307,7 +307,19 @@ class SerialMonitor:
         # Restore default signal handling so Ctrl-C goes through _handle_key
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         try:
-            tty.setraw(fd)
+            # Custom raw mode: like tty.setraw() but keeps OPOST so the
+            # terminal still translates \n → \r\n on output.  Without this,
+            # serial data containing bare \n produces staircase output.
+            raw = termios.tcgetattr(fd)
+            raw[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK |
+                         termios.ISTRIP | termios.IXON)       # iflag
+            # raw[1] — oflag: keep OPOST enabled (don't clear it)
+            raw[2] = (raw[2] & ~(termios.CSIZE | termios.PARENB)) | termios.CS8
+            raw[3] &= ~(termios.ECHO | termios.ICANON |
+                         termios.IEXTEN | termios.ISIG)        # lflag
+            raw[6][termios.VMIN] = 1
+            raw[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSAFLUSH, raw)
             while self.running:
                 ch = os.read(fd, 1)
                 if not ch or not self._handle_key(ch):

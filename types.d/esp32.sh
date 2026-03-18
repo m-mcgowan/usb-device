@@ -54,11 +54,17 @@ type_esp32_boot() {
 # ── Internal helpers ──────────────────────────────────────────────
 
 _esp32_find_esptool() {
-    local pio_python="${HOME}/.platformio/penv/bin/python3"
-    if [ -x "$pio_python" ] && "$pio_python" -c "import esptool" &>/dev/null; then
-        echo "$pio_python -m esptool"
-        return 0
-    fi
+    # Prefer PLATFORMIO_CORE_DIR penv (set by direnv for project-specific installs),
+    # then the default PIO penv, then system esptool.
+    local candidates=(
+        "${PLATFORMIO_CORE_DIR:+${PLATFORMIO_CORE_DIR}/penv/bin/python3}"
+        "${HOME}/.platformio/penv/bin/python3"
+    )
+    for pio_python in "${candidates[@]}"; do
+        [ -n "$pio_python" ] && [ -x "$pio_python" ] && \
+            "$pio_python" -c "import esptool" &>/dev/null && \
+            { echo "$pio_python -m esptool"; return 0; }
+    done
     if command -v esptool.py &>/dev/null; then
         echo "esptool.py"
         return 0

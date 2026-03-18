@@ -40,9 +40,19 @@ def find_insight_hub():
     """Auto-detect the Insight Hub CDC serial port and hub location.
 
     Returns (serial_port, hub_location) or (None, None).
+    Matches by product string first (exact), then falls back to VID/PID
+    only if the product string also contains "Insight" (to avoid matching
+    other ESP32-S3 devices that share the same VID/PID).
     """
     for p in comports():
-        if p.product == INSIGHT_HUB_PRODUCT or (p.vid == INSIGHT_HUB_VID and p.pid == INSIGHT_HUB_PID):
+        if p.product == INSIGHT_HUB_PRODUCT:
+            hub_location = None
+            if p.location:
+                hub_location = p.location.rsplit(".", 1)[0] if "." in p.location else None
+            return p.device, hub_location
+    # Fallback: VID/PID match but only if product contains "Insight"
+    for p in comports():
+        if p.vid == INSIGHT_HUB_VID and p.pid == INSIGHT_HUB_PID and p.product and "Insight" in p.product:
             hub_location = None
             if p.location:
                 hub_location = p.location.rsplit(".", 1)[0] if "." in p.location else None
@@ -60,19 +70,32 @@ class HubConnection:
         time.sleep(0.1)  # let DTR settle
         self._ser.reset_input_buffer()
 
-    def send(self, msg):
-        """Send JSON command, return parsed response or None."""
-        try:
-            payload = json.dumps(msg, separators=(",", ":")) + "\n"
-            self._ser.write(payload.encode())
-            self._ser.flush()
-            line = self._ser.readline().decode("utf-8", errors="replace").strip()
-            if line:
-                return json.loads(line)
-        except json.JSONDecodeError as e:
-            print(f"error: JSON parse: {e}", file=sys.stderr)
-        except OSError as e:
-            print(f"error: serial: {e}", file=sys.stderr)
+    def send(self, msg, retries=2):
+        """Send JSON command, return parsed response or None.
+
+        Retries on timeout or serial errors (transient DTR/buffer issues).
+        """
+        last_err = None
+        for attempt in range(1 + retries):
+            try:
+                if attempt > 0:
+                    time.sleep(0.3)
+                    self._ser.reset_input_buffer()
+                payload = json.dumps(msg, separators=(",", ":")) + "\n"
+                self._ser.write(payload.encode())
+                self._ser.flush()
+                line = self._ser.readline().decode("utf-8", errors="replace").strip()
+                if line:
+                    return json.loads(line)
+                last_err = "timeout (no response)"
+            except json.JSONDecodeError as e:
+                last_err = f"JSON parse: {e}"
+            except OSError as e:
+                last_err = f"serial: {e}"
+            if attempt < retries:
+                print(f"warning: {last_err}, retrying ({attempt + 1}/{retries})...",
+                      file=sys.stderr)
+        print(f"error: {last_err}", file=sys.stderr)
         return None
 
     def close(self):
