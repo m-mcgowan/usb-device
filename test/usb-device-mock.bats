@@ -812,11 +812,12 @@ PLUGIN
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 
     # Create an existing lock from a running process (use PPID which is bats, always alive)
+    # Use current timestamp so TTL hasn't expired
     mkdir -p "$TEST_DIR/locks/device_a"
     cat > "$TEST_DIR/locks/device_a/info" <<EOF
 PID=$PPID
 OWNER=other-user
-TIMESTAMP=2026-02-19T10:00:00Z
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PURPOSE=testing
 TTL=999999
 EOF
@@ -971,12 +972,12 @@ EOF
 @test "checkout: multi-device rolls back on failure" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 
-    # Pre-lock Device B with a live PID
+    # Pre-lock Device B with a live PID and current timestamp so TTL hasn't expired
     mkdir -p "$TEST_DIR/locks/device_b"
     cat > "$TEST_DIR/locks/device_b/info" <<EOF
 PID=$PPID
 OWNER=blocker
-TIMESTAMP=2026-02-19T10:00:00Z
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PURPOSE=blocking
 TTL=999999
 EOF
