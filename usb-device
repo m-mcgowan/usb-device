@@ -1199,9 +1199,27 @@ cmd_reset() {
         die "usage: usb-device reset [-f|--force] <name>"
     fi
     check_lock_warning "$RESOLVED_NAME"
+
+    # ── Step 0: Try type plugin reset (e.g. esptool RTS/DTR for ESP32)
+    # This works for battery-powered devices where USB power cycling won't reset the MCU.
+    load_type_plugin "$RESOLVED_TYPE" 2>/dev/null || true
+    local reset_func="type_${RESOLVED_TYPE}_reset"
+    if declare -f "$reset_func" >/dev/null 2>&1; then
+        RESOLVED_PORT=$(find_serial_port "$RESOLVED_MAC")
+        if [ -n "$RESOLVED_PORT" ]; then
+            "$reset_func" "$RESOLVED_PORT" "$RESOLVED_NAME"
+            # Wait for re-enumeration (port may change after reset)
+            sleep 2
+            if device_is_alive "$RESOLVED_MAC"; then
+                return 0
+            fi
+            echo "Device did not re-enumerate after type reset — falling through to power cycle"
+        fi
+    fi
+
     resolve_hub_port
 
-    # ── Step 0: insight_hub — use serial API (uhubctl can't power-cycle the on-board hub)
+    # ── Step 1: insight_hub special case — use serial API (uhubctl can't power-cycle the on-board hub)
     if [ "$RESOLVED_TYPE" = "insight_hub" ]; then
         local mode
         mode=$(detect_device_mode "$RESOLVED_MAC")
@@ -1222,7 +1240,7 @@ cmd_reset() {
         fi
     fi
 
-    # ── Step 1: Try port-level power cycle ────────────────────────
+    # ── Step 2: Try port-level power cycle ────────────────────────
     local using_insight_hub=0
     if _is_insight_hub_device; then
         using_insight_hub=1
@@ -1255,7 +1273,7 @@ cmd_reset() {
     echo ""
     echo "Device did not come back after port-level reset."
 
-    # ── Step 2: Escalate ──────────────────────────────────────────
+    # ── Step 3: Escalate ──────────────────────────────────────────
     if [ "$using_insight_hub" -eq 1 ]; then
         # Renesas hub chip doesn't support uhubctl — retry via serial API
         # with a fresh connection (re-detect in case the port changed).
@@ -1320,7 +1338,7 @@ cmd_reset() {
         attempts=$((attempts + 1))
     done
 
-    # ── Step 3: Escalate to parent hub power cycle ─────────────────
+    # ── Step 4: Escalate to parent hub power cycle ─────────────────
     local parent_hub="${HUB%.*}"
     if [ "$parent_hub" != "$HUB" ] && [ -n "$parent_hub" ]; then
         local child_port="${HUB##*.}"

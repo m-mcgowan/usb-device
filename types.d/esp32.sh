@@ -12,6 +12,19 @@ type_esp32_commands() {
     echo "bootloader boot"
 }
 
+# Hardware reset via esptool RTS/DTR toggle.
+# Works even when the device is battery-powered (USB power cycle won't reset it).
+# Args: $1=serial_port $2=device_name
+type_esp32_reset() {
+    local serial_port="$1" name="$2"
+    local chip="${RESOLVED_CHIP:-esp32s3}"
+    local esptool
+    esptool=$(_esp32_find_esptool) || die "esptool not found (install PlatformIO or esptool)"
+    echo "Resetting '$name' via esptool ($serial_port)..."
+    $esptool --chip "$chip" --port "$serial_port" --after hard-reset read-mac >/dev/null 2>&1
+    echo "Reset complete."
+}
+
 # Validate ESP32-specific dependencies.
 # Prints [ok]/[FAIL] lines. Returns number of failures.
 type_esp32_check() {
