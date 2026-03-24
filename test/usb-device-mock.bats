@@ -1140,6 +1140,20 @@ EOF
     [ -d "$TEST_DIR/locks/device_c" ]
 }
 
+@test "checkout --export: outputs shell exports" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+EOF
+
+    run "$USB_DEVICE" checkout --export "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"export PIO_LABGRID_DEVICE='Device A'"* ]]
+    [[ "$output" == *"export PLATFORMIO_UPLOAD_PORT='/dev/cu.usbmodem101'"* ]]
+    [[ "$output" == *"export DEVICE_NAME='Device A'"* ]]
+    [[ "$output" == *"export DEVICE_PORT='/dev/cu.usbmodem101'"* ]]
+}
+
 @test "checkout --any: acquires first available match" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
     mock_uhubctl << 'EOF'

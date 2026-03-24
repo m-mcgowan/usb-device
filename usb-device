@@ -842,22 +842,37 @@ EOF
 
 # Print checkout result to stdout (structured, for script consumption).
 _print_checkout_result() {
-    echo "DEVICE_NAME='$RESOLVED_NAME'"
+    local port=""
     if [ -n "$RESOLVED_MAC" ]; then
-        local port
         port=$(find_serial_port "$RESOLVED_MAC")
-        [ -n "$port" ] && echo "DEVICE_PORT='$port'"
     fi
-    echo "DEVICE_TYPE='$RESOLVED_TYPE'"
+
+    if [ "${_checkout_export:-0}" -eq 1 ]; then
+        # Shell-eval format: sets up the terminal for PIO + serial-monitor
+        # pio-labgrid reads this to know which device is reserved
+        echo "export PIO_LABGRID_DEVICE='$RESOLVED_NAME'"
+        # PIO reads PLATFORMIO_UPLOAD_PORT to override upload_port in INI
+        [ -n "$port" ] && echo "export PLATFORMIO_UPLOAD_PORT='$port'"
+        # Generic vars for scripts/tools (serial-monitor, run_tests.sh, etc.)
+        echo "export DEVICE_NAME='$RESOLVED_NAME'"
+        [ -n "$port" ] && echo "export DEVICE_PORT='$port'"
+    else
+        # Structured key=value format
+        echo "DEVICE_NAME='$RESOLVED_NAME'"
+        [ -n "$port" ] && echo "DEVICE_PORT='$port'"
+        echo "DEVICE_TYPE='$RESOLVED_TYPE'"
+    fi
 }
 
 cmd_checkout() {
     local wait=0 timeout=0 owner="" purpose="" ttl="1800" any=0
     _lock_shared=0
+    _checkout_export=0
 
     while [[ "${1:-}" == -* ]]; do
         case "$1" in
             --any)     any=1; shift ;;
+            --export)  _checkout_export=1; shift ;;
             --wait)    wait=1; shift ;;
             --timeout) timeout="$2"; shift 2 ;;
             --owner)   owner="$2"; shift 2 ;;
@@ -868,7 +883,7 @@ cmd_checkout() {
             *)         die "unknown flag: $1" ;;
         esac
     done
-    [ -n "${1:-}" ] || die "usage: usb-device checkout [--any] [--shared] [--wait] [--timeout N] [--owner STR] [--purpose STR] [--ttl N] [--pid PID] <name> [name ...]"
+    [ -n "${1:-}" ] || die "usage: usb-device checkout [--any] [--export] [--shared] [--wait] [--timeout N] [--owner STR] [--purpose STR] [--ttl N] [--pid PID] <name> [name ...]"
 
     mkdir -p "$LOCK_DIR"
     [ -n "$owner" ] || owner="$(whoami)@$(hostname -s)"
@@ -1092,6 +1107,7 @@ Commands:
   off <name>                    Turn off power to a device
   on <name>                     Turn on power to a device
   port <name>                   Print /dev/cu.* path
+  env <name>                    Print shell exports for PIO (eval-able)
   bootloader <name>             Enter bootloader (requires type plugin)
   boot <name>                   Exit bootloader (requires type plugin)
   checkout [opts] <name> [...]  Acquire exclusive access (sorted, all-or-nothing)
@@ -1117,6 +1133,7 @@ Register options:
 
 Checkout options:
   --any                         Acquire first available match (skip locked/offline)
+  --export                      Output shell exports (eval-able) for PIO env vars
   --shared                      Join existing lock if held by same owner (exit 2)
   --wait                        Block until the device is available
   --timeout N                   Give up after N seconds (with --wait)
@@ -1726,6 +1743,18 @@ cmd_port() {
     echo "$RESOLVED_PORT"
 }
 
+cmd_env() {
+    resolve_device "$1"
+    local port=""
+    if [ -n "$RESOLVED_MAC" ]; then
+        port=$(find_serial_port "$RESOLVED_MAC")
+    fi
+    echo "export PIO_LABGRID_DEVICE='$RESOLVED_NAME'"
+    [ -n "$port" ] && echo "export PLATFORMIO_UPLOAD_PORT='$port'"
+    echo "export DEVICE_NAME='$RESOLVED_NAME'"
+    [ -n "$port" ] && echo "export DEVICE_PORT='$port'"
+}
+
 # ── Type-dispatched commands ───────────────────────────────────────
 
 cmd_type() {
@@ -1903,6 +1932,7 @@ dispatch_cmd() {
         off)        cmd_off "${1:-$RESOLVED_NAME}" ;;
         on)         cmd_on "${1:-$RESOLVED_NAME}" ;;
         port)       cmd_port "${1:-$RESOLVED_NAME}" ;;
+        env)        cmd_env "${1:-$RESOLVED_NAME}" ;;
         bootloader) cmd_bootloader "${1:-$RESOLVED_NAME}" ;;
         boot)       cmd_boot "${1:-$RESOLVED_NAME}" ;;
         checkout)   cmd_checkout "$@" ;;
@@ -1915,7 +1945,7 @@ dispatch_cmd() {
 # Chained:    usb-device <device> <cmd1> [cmd2] ...
 is_command() {
     case "$1" in
-        find|field|type|reset|off|on|port|bootloader|boot|checkout|checkin) return 0 ;;
+        find|field|type|reset|off|on|port|env|bootloader|boot|checkout|checkin) return 0 ;;
         *) return 1 ;;
     esac
 }
