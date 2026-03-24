@@ -273,6 +273,46 @@ is_regex() {
     [[ "$1" =~ [\[\]\(\)\{\}\.\*\+\?\^\$\|\\] ]]
 }
 
+# Set all resolved globals from a device index.
+_resolve_from_index() {
+    local idx="$1"
+    RESOLVED_NAME="${DEVICE_NAMES[$idx]}"
+    RESOLVED_MAC="${DEVICE_MACS[$idx]}"
+    RESOLVED_TYPE="${DEVICE_TYPES[$idx]}"
+    RESOLVED_LOCATION="${DEVICE_LOCATIONS[$idx]}"
+    RESOLVED_CHIP="${DEVICE_CHIPS[$idx]}"
+    RESOLVED_HUB_NAME="${DEVICE_HUB_NAMES[$idx]}"
+}
+
+# Find all device indices matching a pattern. Sets MATCH_INDICES array.
+# Returns 0 if any match found, 1 if none.
+_find_matching_indices() {
+    local pattern="$1"
+    MATCH_INDICES=()
+    local i
+
+    # Exact match (case-insensitive) — return immediately
+    for i in "${!DEVICE_NAMES[@]}"; do
+        if echo "${DEVICE_NAMES[$i]}" | grep -iqx "$pattern"; then
+            MATCH_INDICES=("$i")
+            return 0
+        fi
+    done
+
+    # Fuzzy match: regex if special chars detected, otherwise case-insensitive substring
+    if is_regex "$pattern"; then
+        for i in "${!DEVICE_NAMES[@]}"; do
+            echo "${DEVICE_NAMES[$i]}" | grep -iqE "$pattern" && MATCH_INDICES+=("$i")
+        done
+    else
+        for i in "${!DEVICE_NAMES[@]}"; do
+            echo "${DEVICE_NAMES[$i]}" | grep -iqF "$pattern" && MATCH_INDICES+=("$i")
+        done
+    fi
+
+    [ ${#MATCH_INDICES[@]} -gt 0 ]
+}
+
 # Resolve a device pattern to RESOLVED_NAME, RESOLVED_MAC, RESOLVED_TYPE, RESOLVED_LOCATION.
 # Supports exact, substring, and regex matching with interactive selection.
 resolve_device() {
@@ -285,69 +325,33 @@ resolve_device() {
     RESOLVED_CHIP=""
     RESOLVED_HUB_NAME=""
 
-    local i
-
-    # Helper to set all resolved globals from index
-    _resolve_from_index() {
-        local idx="$1"
-        RESOLVED_NAME="${DEVICE_NAMES[$idx]}"
-        RESOLVED_MAC="${DEVICE_MACS[$idx]}"
-        RESOLVED_TYPE="${DEVICE_TYPES[$idx]}"
-        RESOLVED_LOCATION="${DEVICE_LOCATIONS[$idx]}"
-        RESOLVED_CHIP="${DEVICE_CHIPS[$idx]}"
-        RESOLVED_HUB_NAME="${DEVICE_HUB_NAMES[$idx]}"
-    }
-
-    # Exact match (case-insensitive)
-    for i in "${!DEVICE_NAMES[@]}"; do
-        if echo "${DEVICE_NAMES[$i]}" | grep -iqx "$pattern"; then
-            _resolve_from_index "$i"
-            return 0
-        fi
-    done
-
-    # Fuzzy match: regex if special chars detected, otherwise case-insensitive substring
-    local -a matches=() match_indices=()
-
-    if is_regex "$pattern"; then
-        for i in "${!DEVICE_NAMES[@]}"; do
-            if echo "${DEVICE_NAMES[$i]}" | grep -iqE "$pattern"; then
-                matches+=("${DEVICE_NAMES[$i]}")
-                match_indices+=("$i")
-            fi
-        done
-    else
-        for i in "${!DEVICE_NAMES[@]}"; do
-            if echo "${DEVICE_NAMES[$i]}" | grep -iqF "$pattern"; then
-                matches+=("${DEVICE_NAMES[$i]}")
-                match_indices+=("$i")
-            fi
-        done
-    fi
-
-    if [ ${#matches[@]} -eq 0 ]; then
+    if ! _find_matching_indices "$pattern"; then
         echo "No devices match '$pattern'" >&2
         echo "" >&2
         echo "Known devices:" >&2
         all_device_names | while read -r n; do echo "  $n" >&2; done
         exit 1
-    elif [ ${#matches[@]} -eq 1 ]; then
-        _resolve_from_index "${match_indices[0]}"
+    fi
+
+    if [ ${#MATCH_INDICES[@]} -eq 1 ]; then
+        _resolve_from_index "${MATCH_INDICES[0]}"
+        return 0
+    fi
+
+    # Multiple matches — interactive selection
+    echo "Multiple devices match '$pattern':" >&2
+    local i
+    for i in "${!MATCH_INDICES[@]}"; do
+        echo "  $((i+1))) ${DEVICE_NAMES[${MATCH_INDICES[$i]}]}" >&2
+    done
+    printf "Select [1-%d]: " "${#MATCH_INDICES[@]}" >&2
+    local choice
+    read -r choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#MATCH_INDICES[@]} ]; then
+        _resolve_from_index "${MATCH_INDICES[$((choice - 1))]}"
         return 0
     else
-        echo "Multiple devices match '$pattern':" >&2
-        for i in "${!matches[@]}"; do
-            echo "  $((i+1))) ${matches[$i]}" >&2
-        done
-        printf "Select [1-%d]: " "${#matches[@]}" >&2
-        local choice
-        read -r choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#matches[@]} ]; then
-            _resolve_from_index "${match_indices[$((choice - 1))]}"
-            return 0
-        else
-            die "invalid selection"
-        fi
+        die "invalid selection"
     fi
 }
 
@@ -595,6 +599,38 @@ _lock_field() {
     grep "^${field}=" "$lock_path/info" 2>/dev/null | cut -d= -f2-
 }
 
+# Parse an ISO 8601 UTC timestamp to epoch seconds.
+_parse_utc_timestamp() {
+    local ts="$1"
+    # macOS: -jf parses format string; must set TZ=UTC since the Z is literal
+    TZ=UTC date -jf "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null || \
+        date -d "$ts" +%s 2>/dev/null
+}
+
+# Format seconds as human-readable duration (e.g. "2m 30s", "1h 15m").
+_format_duration() {
+    local secs="$1"
+    if [ "$secs" -lt 60 ]; then
+        echo "${secs}s"
+    elif [ "$secs" -lt 3600 ]; then
+        echo "$((secs / 60))m $((secs % 60))s"
+    elif [ "$secs" -lt 86400 ]; then
+        echo "$((secs / 3600))h $((secs % 3600 / 60))m"
+    else
+        echo "$((secs / 86400))d $((secs % 86400 / 3600))h"
+    fi
+}
+
+# Format a UTC ISO timestamp as local time (e.g. "Mon 14:32").
+_format_local_time() {
+    local ts="$1"
+    local epoch
+    epoch=$(_parse_utc_timestamp "$ts") || return 1
+    # macOS: -jf with epoch; Linux: -d @epoch
+    date -r "$epoch" "+%a %H:%M" 2>/dev/null || \
+        date -d "@$epoch" "+%a %H:%M" 2>/dev/null
+}
+
 # Check if a lock is stale and reclaim it if so. Returns 0 if reclaimed/absent.
 _try_reclaim_lock() {
     local lock_path="$1"
@@ -624,15 +660,12 @@ _try_reclaim_lock() {
     if [ -n "$lock_ts" ] && [ -n "$lock_ttl" ] && [ "$lock_ttl" -gt 0 ] 2>/dev/null; then
         local now lock_epoch
         now=$(date +%s)
-        # macOS date -jf for parsing, with fallback for GNU date
-        lock_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$lock_ts" +%s 2>/dev/null) || \
-            lock_epoch=$(date -d "$lock_ts" +%s 2>/dev/null) || \
-            return 1
+        lock_epoch=$(_parse_utc_timestamp "$lock_ts") || return 1
         if [ $((now - lock_epoch)) -gt "$lock_ttl" ]; then
             local owner age
             owner=$(_lock_field "$lock_path" "OWNER")
-            age=$((now - lock_epoch))
-            echo "Reclaiming expired lock (age ${age}s > TTL ${lock_ttl}s, was: ${owner:-unknown})" >&2
+            age=$(_format_duration $((now - lock_epoch)))
+            echo "Reclaiming expired lock (age $age > TTL ${lock_ttl}s, was: ${owner:-unknown})" >&2
             rm -rf "$lock_path"
             return 0
         fi
@@ -654,8 +687,22 @@ _show_lock_holder() {
     echo "  owner:   ${owner:--}" >&2
     echo "  pid:     ${pid:--}" >&2
     [ -n "$purpose" ] && echo "  purpose: $purpose" >&2
-    echo "  since:   ${ts:--}" >&2
-    [ -n "$ttl" ] && [ "$ttl" -gt 0 ] 2>/dev/null && echo "  ttl:     ${ttl}s" >&2
+    if [ -n "$ts" ]; then
+        local local_time age_str
+        local_time=$(_format_local_time "$ts") || local_time="$ts"
+        local lock_epoch now
+        now=$(date +%s)
+        lock_epoch=$(_parse_utc_timestamp "$ts") || lock_epoch=0
+        if [ "$lock_epoch" -gt 0 ]; then
+            age_str=$(_format_duration $((now - lock_epoch)))
+            echo "  since:   $local_time ($age_str ago)" >&2
+        else
+            echo "  since:   $local_time" >&2
+        fi
+    else
+        echo "  since:   -" >&2
+    fi
+    [ -n "$ttl" ] && [ "$ttl" -gt 0 ] 2>/dev/null && echo "  ttl:     $(_format_duration "$ttl")" >&2
 }
 
 # Acquire a single device lock. Internal — called by cmd_checkout.
@@ -667,12 +714,14 @@ _checkout_one() {
     local lock_path
     lock_path=$(_lock_path "$RESOLVED_NAME")
 
+    local my_pid="${_lock_pid:-$PPID}"
+
     while true; do
         _try_reclaim_lock "$lock_path"
 
         if mkdir "$lock_path" 2>/dev/null; then
             cat > "$lock_path/info" <<EOF
-PID=$$
+PID=$my_pid
 OWNER=$owner
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PURPOSE=$purpose
@@ -680,6 +729,31 @@ TTL=$ttl
 EOF
             echo "Checked out '$RESOLVED_NAME'" >&2
             return 0
+        fi
+
+        # Re-entrant: if we already hold the lock, refresh it
+        local lock_pid
+        lock_pid=$(_lock_field "$lock_path" "PID")
+        if [ -n "$lock_pid" ] && [ "$lock_pid" = "$my_pid" ]; then
+            cat > "$lock_path/info" <<EOF
+PID=$my_pid
+OWNER=$owner
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=$purpose
+TTL=$ttl
+EOF
+            echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+            return 0
+        fi
+
+        # Shared: if same owner holds the lock, join without modifying
+        if [ "${_lock_shared:-0}" -eq 1 ]; then
+            local lock_owner
+            lock_owner=$(_lock_field "$lock_path" "OWNER")
+            if [ -n "$lock_owner" ] && [ "$lock_owner" = "$owner" ]; then
+                echo "Sharing lock on '$RESOLVED_NAME' (held by $lock_owner)" >&2
+                return 2
+            fi
         fi
 
         if [ "$wait" -eq 0 ]; then
@@ -698,23 +772,113 @@ EOF
     done
 }
 
+# Try to checkout the first available device matching a pattern.
+# Iterates through matches, skipping locked and offline devices.
+# On success, prints device info to stdout.
+_checkout_any() {
+    local pattern="$1" owner="$2" purpose="$3" ttl="$4"
+
+    parse_config
+    mkdir -p "$LOCK_DIR"
+
+    if ! _find_matching_indices "$pattern"; then
+        echo "No devices match '$pattern'" >&2
+        return 1
+    fi
+
+    local my_pid="${_lock_pid:-$PPID}"
+
+    for i in "${MATCH_INDICES[@]}"; do
+        local name="${DEVICE_NAMES[$i]}"
+        local mac="${DEVICE_MACS[$i]}"
+
+        # Skip offline devices
+        if [ -n "$mac" ] && ! _is_connected "$mac"; then
+            echo "skip: '$name' — offline" >&2
+            continue
+        fi
+
+        # Try to acquire
+        _resolve_from_index "$i"
+        local lock_path
+        lock_path=$(_lock_path "$RESOLVED_NAME")
+        _try_reclaim_lock "$lock_path" 2>/dev/null
+
+        if mkdir "$lock_path" 2>/dev/null; then
+            cat > "$lock_path/info" <<EOF
+PID=$my_pid
+OWNER=$owner
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=$purpose
+TTL=$ttl
+EOF
+            echo "Checked out '$RESOLVED_NAME'" >&2
+            _print_checkout_result
+            return 0
+        fi
+
+        # Re-entrant: if we already hold the lock, refresh it
+        local lock_pid
+        lock_pid=$(_lock_field "$lock_path" "PID")
+        if [ -n "$lock_pid" ] && [ "$lock_pid" = "$my_pid" ]; then
+            cat > "$lock_path/info" <<EOF
+PID=$my_pid
+OWNER=$owner
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=$purpose
+TTL=$ttl
+EOF
+            echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+            _print_checkout_result
+            return 0
+        fi
+
+        echo "skip: '$name' — locked" >&2
+    done
+
+    echo "No available devices match '$pattern'" >&2
+    return 1
+}
+
+# Print checkout result to stdout (structured, for script consumption).
+_print_checkout_result() {
+    echo "DEVICE_NAME='$RESOLVED_NAME'"
+    if [ -n "$RESOLVED_MAC" ]; then
+        local port
+        port=$(find_serial_port "$RESOLVED_MAC")
+        [ -n "$port" ] && echo "DEVICE_PORT='$port'"
+    fi
+    echo "DEVICE_TYPE='$RESOLVED_TYPE'"
+}
+
 cmd_checkout() {
-    local wait=0 timeout=0 owner="" purpose="" ttl="1800"
+    local wait=0 timeout=0 owner="" purpose="" ttl="1800" any=0
+    _lock_shared=0
 
     while [[ "${1:-}" == -* ]]; do
         case "$1" in
+            --any)     any=1; shift ;;
             --wait)    wait=1; shift ;;
             --timeout) timeout="$2"; shift 2 ;;
             --owner)   owner="$2"; shift 2 ;;
             --purpose) purpose="$2"; shift 2 ;;
             --ttl)     ttl="$2"; shift 2 ;;
+            --pid)     _lock_pid="$2"; shift 2 ;;
+            --shared)  _lock_shared=1; shift ;;
             *)         die "unknown flag: $1" ;;
         esac
     done
-    [ -n "${1:-}" ] || die "usage: usb-device checkout [--wait] [--timeout N] [--owner STR] [--purpose STR] [--ttl N] <name> [name ...]"
+    [ -n "${1:-}" ] || die "usage: usb-device checkout [--any] [--shared] [--wait] [--timeout N] [--owner STR] [--purpose STR] [--ttl N] [--pid PID] <name> [name ...]"
 
     mkdir -p "$LOCK_DIR"
     [ -n "$owner" ] || owner="$(whoami)@$(hostname -s)"
+
+    # --any: find first available matching device
+    if [ "$any" -eq 1 ]; then
+        [ $# -eq 1 ] || die "--any requires exactly one pattern"
+        _checkout_any "$1" "$owner" "$purpose" "$ttl"
+        return $?
+    fi
 
     local deadline=0
     [ "$wait" -eq 1 ] && [ "$timeout" -gt 0 ] && deadline=$(( $(date +%s) + timeout ))
@@ -726,10 +890,15 @@ cmd_checkout() {
     done < <(printf '%s\n' "$@" | sort -f)
 
     # Acquire all locks in sorted order; rollback on failure
-    local acquired=()
+    # _checkout_one returns: 0=acquired, 2=shared (joined existing), 1=failed
+    local acquired=() has_shared=0
     for name in "${sorted_names[@]}"; do
-        if _checkout_one "$name" "$owner" "$purpose" "$ttl" "$wait" "$deadline"; then
+        _checkout_one "$name" "$owner" "$purpose" "$ttl" "$wait" "$deadline"
+        local rc=$?
+        if [ "$rc" -eq 0 ]; then
             acquired+=("$RESOLVED_NAME")
+        elif [ "$rc" -eq 2 ]; then
+            has_shared=1
         else
             # Rollback: release all already-acquired locks
             for held in "${acquired[@]}"; do
@@ -741,9 +910,19 @@ cmd_checkout() {
             return 1
         fi
     done
+
+    # Print result for last acquired device
+    if [ ${#acquired[@]} -gt 0 ]; then
+        _print_checkout_result
+    fi
+
+    # Exit 0 if all acquired, 2 if any were shared joins
+    [ "$has_shared" -eq 1 ] && return 2
+    return 0
 }
 
 # Release a single device lock. Internal — called by cmd_checkin.
+# Without -f, only releases locks owned by this session (matching PPID or $$).
 _checkin_one() {
     local name="$1" force="$2"
 
@@ -760,19 +939,11 @@ _checkin_one() {
     if [ "$force" -eq 0 ]; then
         local lock_pid
         lock_pid=$(_lock_field "$lock_path" "PID")
-        if [ -n "$lock_pid" ] && [ "$lock_pid" != "$$" ]; then
-            local pid_alive=0
-            if kill -0 "$lock_pid" 2>/dev/null; then
-                pid_alive=1
-            elif ! kill -0 "$lock_pid" 2>&1 | grep -q "No such process"; then
-                pid_alive=1  # EPERM — process exists but owned by another user
-            fi
-            if [ "$pid_alive" -eq 1 ]; then
-                echo "Device '$RESOLVED_NAME' is checked out by another process:" >&2
-                _show_lock_holder "$lock_path"
-                echo "Use -f to force release" >&2
-                return 1
-            fi
+        if [ -n "$lock_pid" ] && [ "$lock_pid" != "$PPID" ] && [ "$lock_pid" != "$$" ]; then
+            echo "Device '$RESOLVED_NAME' is not owned by this session:" >&2
+            _show_lock_holder "$lock_path"
+            echo "Use -f to force release" >&2
+            return 1
         fi
     fi
 
@@ -782,14 +953,45 @@ _checkin_one() {
 }
 
 cmd_checkin() {
-    local force=0
+    local force=0 mine=0
     while [[ "${1:-}" == -* ]]; do
         case "$1" in
             -f|--force) force=1; shift ;;
+            --mine)     mine=1; shift ;;
+            --pid)      _lock_pid="$2"; shift 2 ;;
             *)          die "unknown flag: $1" ;;
         esac
     done
-    [ -n "${1:-}" ] || die "usage: usb-device checkin [-f|--force] <name> [name ...]"
+
+    # No args without --mine: refuse (too easy to accidentally release all)
+    if [ "$mine" -eq 0 ] && [ -z "${1:-}" ]; then
+        die "usage: usb-device checkin <name> [name ...] or usb-device checkin --mine"
+    fi
+
+    # --mine: release all locks held by our PPID
+    if [ "$mine" -eq 1 ]; then
+        mkdir -p "$LOCK_DIR"
+        parse_config
+        local my_pid="${_lock_pid:-$PPID}"
+        local released=0
+        for i in "${!DEVICE_NAMES[@]}"; do
+            local name="${DEVICE_NAMES[$i]}"
+            local lock_path
+            lock_path=$(_lock_path "$name")
+            [ -d "$lock_path" ] || continue
+            local lock_pid
+            lock_pid=$(_lock_field "$lock_path" "PID")
+            if [ -n "$lock_pid" ] && [ "$lock_pid" = "$my_pid" ]; then
+                rm -rf "$lock_path"
+                echo "Checked in '$name'" >&2
+                released=$((released + 1))
+            fi
+        done
+        if [ "$released" -eq 0 ]; then
+            echo "No devices checked out by this session (pid $my_pid)" >&2
+        fi
+        return 0
+    fi
 
     local failed=0
     for name in "$@"; do
@@ -822,27 +1024,21 @@ cmd_locks() {
             ts=$(_lock_field "$lock_path" "TIMESTAMP")
             ttl=$(_lock_field "$lock_path" "TTL")
 
-            local age_str=""
+            local age_str="" time_str=""
             if [ -n "$ts" ]; then
                 local lock_epoch now
                 now=$(date +%s)
-                lock_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null) || \
-                    lock_epoch=$(date -d "$ts" +%s 2>/dev/null) || lock_epoch=0
+                lock_epoch=$(_parse_utc_timestamp "$ts") || lock_epoch=0
                 if [ "$lock_epoch" -gt 0 ]; then
-                    local age=$((now - lock_epoch))
-                    if [ "$age" -lt 60 ]; then
-                        age_str="${age}s"
-                    elif [ "$age" -lt 3600 ]; then
-                        age_str="$((age / 60))m"
-                    else
-                        age_str="$((age / 3600))h$((age % 3600 / 60))m"
-                    fi
+                    age_str=$(_format_duration $((now - lock_epoch)))
                 fi
+                time_str=$(_format_local_time "$ts")
             fi
 
             local detail="${owner:-?}"
             [ -n "$purpose" ] && detail="$detail ($purpose)"
-            [ -n "$age_str" ] && detail="$detail, ${age_str} ago"
+            [ -n "$time_str" ] && detail="$detail, since $time_str"
+            [ -n "$age_str" ] && detail="$detail (${age_str} ago)"
             [ -n "$pid" ] && detail="$detail, pid=$pid"
 
             printf "  %-30s  LOCKED  %s\n" "$name" "$detail"
@@ -866,6 +1062,7 @@ check_lock_warning() {
     local lock_pid
     lock_pid=$(_lock_field "$lock_path" "PID")
     # Don't warn if we hold the lock
+    [ "$lock_pid" = "$PPID" ] && return 0
     [ "$lock_pid" = "$$" ] && return 0
 
     local owner
@@ -887,7 +1084,9 @@ Commands:
   scan                          Scan USB bus and update last-known locations
   check                         Verify all dependencies are installed
   register <name> [options]     Register a new device
-  find <name>                   Show hub, port, serial device info
+  find [-a|--available] <name>  Show hub, port, serial device info (with lock status)
+                                  -a: first connected+unlocked match (no prompt)
+  field <name> <key>            Print a custom config field value (for scripting)
   type <name>                   Print device type (for scripting)
   reset [-f|--force] <name>     Power-cycle a device (escalates to hub if needed)
   off <name>                    Turn off power to a device
@@ -895,8 +1094,11 @@ Commands:
   port <name>                   Print /dev/cu.* path
   bootloader <name>             Enter bootloader (requires type plugin)
   boot <name>                   Exit bootloader (requires type plugin)
-  checkout [opts] <name> [...]  Acquire exclusive access (multi-device: sorted, all-or-nothing)
-  checkin [-f] <name> [...]     Release exclusive access
+  checkout [opts] <name> [...]  Acquire exclusive access (sorted, all-or-nothing)
+                                  --any: first available match (no prompt)
+                                  --shared: join existing lock if same owner
+  checkin [-f] <name> [...]     Release exclusive access (must own the lock)
+  checkin --mine                Release all locks held by this session (requires flag)
   locks                         Show all checked-out devices
   hub status                    Show Insight Hub channels and device assignments
   hub sync                      One-shot: push device names to hub displays
@@ -914,11 +1116,14 @@ Register options:
   --hub-name NAME               Display name for Insight Hub (max 14 chars)
 
 Checkout options:
+  --any                         Acquire first available match (skip locked/offline)
+  --shared                      Join existing lock if held by same owner (exit 2)
   --wait                        Block until the device is available
   --timeout N                   Give up after N seconds (with --wait)
   --owner STR                   Who is checking out (default: user@host)
   --purpose STR                 Why (shown in locks output)
   --ttl N                       Auto-expire lock after N seconds (default: 1800)
+  --pid PID                     Store PID for lock ownership (default: caller's PID)
 
 Chained commands (device name first, then one or more commands):
   usb-device "1.9" reset bootloader    # power-cycle then enter bootloader
@@ -1141,8 +1346,35 @@ cmd_list() {
     done
 }
 
-cmd_find() {
-    resolve_device "$1"
+# Check if a device is locked (not stale). Returns 0 if locked, 1 if free.
+# Sets LOCK_OWNER, LOCK_PURPOSE, LOCK_PID if locked.
+_is_locked() {
+    local name="$1"
+    local lock_path
+    lock_path=$(_lock_path "$name")
+    [ -d "$lock_path" ] || return 1
+    # Reclaim stale locks silently
+    if _try_reclaim_lock "$lock_path" 2>/dev/null; then
+        return 1
+    fi
+    LOCK_OWNER=$(_lock_field "$lock_path" "OWNER")
+    LOCK_PURPOSE=$(_lock_field "$lock_path" "PURPOSE")
+    LOCK_PID=$(_lock_field "$lock_path" "PID")
+    return 0
+}
+
+# Check if a device is connected (has a serial port or live hub port).
+_is_connected() {
+    local mac="$1"
+    [ -z "$mac" ] && return 1
+    local serial_port
+    serial_port=$(find_serial_port "$mac")
+    [ -n "$serial_port" ] && return 0
+    find_hub_port_live "$mac" >/dev/null 2>&1
+}
+
+# Print info for a single resolved device (shared by cmd_find and _find_available).
+_print_device_info() {
     resolve_hub_port
     echo "name: $RESOLVED_NAME"
     echo "type: $RESOLVED_TYPE"
@@ -1171,7 +1403,80 @@ cmd_find() {
     local type_cmds
     type_cmds=$(get_type_commands "$RESOLVED_TYPE")
     [ -n "$type_cmds" ] && echo "cmds: $type_cmds"
+    # Show lock status
+    mkdir -p "$LOCK_DIR"
+    if _is_locked "$RESOLVED_NAME"; then
+        local detail="$LOCK_OWNER"
+        [ -n "$LOCK_PURPOSE" ] && detail="$detail ($LOCK_PURPOSE)"
+        echo "lock: LOCKED by $detail"
+    else
+        echo "lock: available"
+    fi
+}
+
+cmd_find() {
+    local available=0
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            -a|--available) available=1; shift ;;
+            *)              die "unknown flag: $1" ;;
+        esac
+    done
+
+    if [ "$available" -eq 1 ]; then
+        _find_available "${1:-}"
+        return $?
+    fi
+
+    # resolve_device unless already resolved (chained mode)
+    if [ -n "${1:-}" ]; then
+        resolve_device "$1"
+    elif [ -z "$RESOLVED_NAME" ]; then
+        die "usage: usb-device find [-a|--available] <name>"
+    fi
+    _print_device_info
     return 0
+}
+
+# Find the first matching device that is connected and not locked.
+# Outputs device info. Exits non-zero if none available.
+_find_available() {
+    local pattern="${1:-}"
+    [ -n "$pattern" ] || die "usage: usb-device find --available <pattern>"
+
+    parse_config
+    mkdir -p "$LOCK_DIR"
+
+    if ! _find_matching_indices "$pattern"; then
+        echo "No devices match '$pattern'" >&2
+        return 1
+    fi
+
+    # Find first that is connected and not locked
+    for i in "${MATCH_INDICES[@]}"; do
+        local name="${DEVICE_NAMES[$i]}"
+        local mac="${DEVICE_MACS[$i]}"
+
+        # Skip locked
+        if _is_locked "$name"; then
+            echo "skip: '$name' — locked by ${LOCK_OWNER:-?}" >&2
+            continue
+        fi
+
+        # Skip disconnected
+        if [ -n "$mac" ] && ! _is_connected "$mac"; then
+            echo "skip: '$name' — offline" >&2
+            continue
+        fi
+
+        # Found one — resolve and print
+        _resolve_from_index "$i"
+        _print_device_info
+        return 0
+    done
+
+    echo "No available devices match '$pattern'" >&2
+    return 1
 }
 
 # Get commands supported by a device type (from plugin).
@@ -1428,6 +1733,27 @@ cmd_type() {
     echo "$RESOLVED_TYPE"
 }
 
+# Print the value of an arbitrary key from a device's section in devices.conf.
+# Useful for project-specific metadata (e.g. notecard_uid, serial_number).
+# Exits non-zero and prints nothing if the key is absent.
+cmd_field() {
+    local name="$1" key="$2"
+    [ -n "$name" ] || die "usage: usb-device field <name> <key>"
+    [ -n "$key"  ] || die "usage: usb-device field <name> <key>"
+    local val
+    val=$(awk -v section="[$name]" -v k="$key" '
+        $0 == section   { in_s=1; next }
+        /^\[/           { in_s=0 }
+        in_s && $0 ~ "^"k"[ \t]*=" {
+            sub(/^[^=]*=[ \t]*/, "")
+            print
+            exit
+        }
+    ' "$CONF")
+    [ -n "$val" ] || return 1
+    echo "$val"
+}
+
 cmd_bootloader() {
     resolve_device "$1"
     check_lock_warning "$RESOLVED_NAME"
@@ -1570,7 +1896,8 @@ esac
 dispatch_cmd() {
     local cmd="$1"; shift
     case "$cmd" in
-        find)       cmd_find "${1:-$RESOLVED_NAME}" ;;
+        find)       cmd_find "$@" ;;
+        field)      cmd_field "${1:-$RESOLVED_NAME}" "${2:-}" ;;
         type)       cmd_type "${1:-$RESOLVED_NAME}" ;;
         reset)      cmd_reset "$@" ;;
         off)        cmd_off "${1:-$RESOLVED_NAME}" ;;
@@ -1588,7 +1915,7 @@ dispatch_cmd() {
 # Chained:    usb-device <device> <cmd1> [cmd2] ...
 is_command() {
     case "$1" in
-        find|type|reset|off|on|port|bootloader|boot|checkout|checkin) return 0 ;;
+        find|field|type|reset|off|on|port|bootloader|boot|checkout|checkin) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -1602,7 +1929,7 @@ if is_command "$1"; then
     # Traditional: usb-device <command> [flags] <device>
     cmd="$1"; shift
     case "$cmd" in
-        reset|checkout|checkin) dispatch_cmd "$cmd" "$@" ;;
+        reset|checkout|checkin|find|field) dispatch_cmd "$cmd" "$@" ;;
         *)
             [ -n "${1:-}" ] || die "usage: usb-device $cmd <name>"
             dispatch_cmd "$cmd" "$1"

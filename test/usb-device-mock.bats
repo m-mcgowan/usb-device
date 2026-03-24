@@ -847,10 +847,10 @@ EOF
     [[ "$output" == *"Checked out"* ]]
 }
 
-@test "checkin: releases lock from dead process" {
+@test "checkin: refuses lock from dead process without -f" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 
-    # Create a lock with a dead PID — checkin should release it
+    # Create a lock with a dead PID — not ours, needs -f
     mkdir -p "$TEST_DIR/locks/device_a"
     cat > "$TEST_DIR/locks/device_a/info" <<EOF
 PID=99998
@@ -861,8 +861,13 @@ TTL=1800
 EOF
 
     run "$USB_DEVICE" checkin "Device A"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"not owned by this session"* ]]
+    [ -d "$TEST_DIR/locks/device_a" ]
+
+    # Force release works
+    run "$USB_DEVICE" checkin -f "Device A"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Checked in"* ]]
     [ ! -d "$TEST_DIR/locks/device_a" ]
 }
 
@@ -881,7 +886,7 @@ EOF
 
     run "$USB_DEVICE" checkin "Device A"
     [ "$status" -eq 1 ]
-    [[ "$output" == *"checked out by another"* ]]
+    [[ "$output" == *"not owned by this session"* ]]
     # Lock should still exist
     [ -d "$TEST_DIR/locks/device_a" ]
 }
@@ -993,18 +998,318 @@ EOF
     [ -d "$TEST_DIR/locks/device_b" ]
 }
 
-@test "checkin: multi-device releases all" {
+@test "checkin: multi-device releases all (force)" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 
-    # Checkout two devices
-    "$USB_DEVICE" checkout "Device A" "Device B"
+    # Pre-create locks with a different PID — need -f to release
+    for dev in device_a device_b; do
+        mkdir -p "$TEST_DIR/locks/$dev"
+        cat > "$TEST_DIR/locks/$dev/info" <<EOF
+PID=99997
+OWNER=test
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=multi-checkin test
+TTL=1800
+EOF
+    done
 
-    run "$USB_DEVICE" checkin "Device A" "Device B"
+    run "$USB_DEVICE" checkin -f "Device A" "Device B"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Checked in 'Device A'"* ]]
     [[ "$output" == *"Checked in 'Device B'"* ]]
     [ ! -d "$TEST_DIR/locks/device_a" ]
     [ ! -d "$TEST_DIR/locks/device_b" ]
+}
+
+@test "checkout: re-entrant — same PID refreshes lock" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Create a lock owned by our PPID (simulates prior checkout from same shell)
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=test
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=original
+TTL=3600
+EOF
+
+    # Checkout again with same PID should succeed (re-entrant)
+    run "$USB_DEVICE" checkout --pid "$PPID" --purpose "refreshed" "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Refreshed lock"* ]]
+
+    # Lock should have updated purpose
+    run grep "^PURPOSE=refreshed" "$TEST_DIR/locks/device_a/info"
+    [ "$status" -eq 0 ]
+}
+
+@test "checkout: --pid stores explicit PID" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    run "$USB_DEVICE" checkout --pid 12345 "Device A"
+    [ "$status" -eq 0 ]
+
+    run grep "^PID=12345" "$TEST_DIR/locks/device_a/info"
+    [ "$status" -eq 0 ]
+}
+
+@test "checkout --shared: joins lock held by same owner" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Create a lock held by the default owner (whoami@hostname)
+    local owner="$(whoami)@$(hostname -s)"
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=$owner
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=terminal session
+TTL=3600
+EOF
+
+    run "$USB_DEVICE" checkout --shared "Device A"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"Sharing lock"* ]]
+
+    # Original lock should be unmodified
+    run grep "^PURPOSE=terminal session" "$TEST_DIR/locks/device_a/info"
+    [ "$status" -eq 0 ]
+}
+
+@test "checkout --shared: fails when different owner holds lock" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=someone-else@other-host
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=their work
+TTL=3600
+EOF
+
+    run "$USB_DEVICE" checkout --shared "Device A"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"checked out"* ]]
+}
+
+@test "checkout --shared: acquires normally when device is free" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    run "$USB_DEVICE" checkout --shared "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Checked out"* ]]
+    [ -d "$TEST_DIR/locks/device_a" ]
+}
+
+@test "checkin --mine: releases all locks held by matching PID" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Create two locks owned by PID 55555, one by someone else
+    for dev in device_a device_b device_c; do
+        mkdir -p "$TEST_DIR/locks/$dev"
+    done
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=55555
+OWNER=me
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TTL=3600
+EOF
+    cat > "$TEST_DIR/locks/device_b/info" <<EOF
+PID=55555
+OWNER=me
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TTL=3600
+EOF
+    cat > "$TEST_DIR/locks/device_c/info" <<EOF
+PID=99999
+OWNER=other
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TTL=3600
+EOF
+
+    run "$USB_DEVICE" checkin --mine --pid 55555
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Checked in 'Device A'"* ]]
+    [[ "$output" == *"Checked in 'Device B'"* ]]
+
+    # Our locks gone, other's lock preserved
+    [ ! -d "$TEST_DIR/locks/device_a" ]
+    [ ! -d "$TEST_DIR/locks/device_b" ]
+    [ -d "$TEST_DIR/locks/device_c" ]
+}
+
+@test "checkout --any: acquires first available match" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+    mock_uhubctl << 'EOF'
+Current status for hub 20-4 [0000:0000, USB 2.10, 4 ports, ppps]
+  Port 1: 0103 power enable connect [303a:1001 Espressif USB JTAG AA:AA:AA:AA:AA:AA]
+  Port 2: 0103 power enable connect [303a:1001 Espressif USB JTAG BB:BB:BB:BB:BB:BB]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+BB:BB:BB:BB:BB:BB|/dev/cu.usbmodem102|20-4.2
+EOF
+
+    # Lock Device A
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=someone
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=blocking
+TTL=3600
+EOF
+
+    run "$USB_DEVICE" checkout --any "Device"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DEVICE_NAME='Device B'"* ]]
+    [ -d "$TEST_DIR/locks/device_b" ]
+}
+
+@test "checkout --any: prints structured output" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+EOF
+
+    run "$USB_DEVICE" checkout --any "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DEVICE_NAME='Device A'"* ]]
+    [[ "$output" == *"DEVICE_PORT='/dev/cu.usbmodem101'"* ]]
+}
+
+@test "checkout --any: fails when all locked" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+    mock_uhubctl << 'EOF'
+Current status for hub 20-4 [0000:0000, USB 2.10, 4 ports, ppps]
+  Port 1: 0103 power enable connect [303a:1001 Espressif USB JTAG AA:AA:AA:AA:AA:AA]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+EOF
+
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=blocker
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=blocking
+TTL=3600
+EOF
+
+    run "$USB_DEVICE" checkout --any "Device A"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"No available devices"* ]]
+}
+
+@test "find: shows lock status — available" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+    mock_uhubctl << 'EOF'
+Current status for hub 20-4 [0000:0000, USB 2.10, 4 ports, ppps]
+  Port 1: 0103 power enable connect [303a:1001 Espressif USB JTAG AA:AA:AA:AA:AA:AA]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+EOF
+
+    run "$USB_DEVICE" find "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"lock: available"* ]]
+}
+
+@test "find: shows lock status — locked" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+    mock_uhubctl << 'EOF'
+Current status for hub 20-4 [0000:0000, USB 2.10, 4 ports, ppps]
+  Port 1: 0103 power enable connect [303a:1001 Espressif USB JTAG AA:AA:AA:AA:AA:AA]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+EOF
+
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=ci-bot
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=nightly
+TTL=1800
+EOF
+
+    run "$USB_DEVICE" find "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"lock: LOCKED by ci-bot (nightly)"* ]]
+}
+
+@test "find --available: selects first unlocked+connected device" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Three devices: A locked, B connected, C connected
+    cat > "$CONF" << 'EOF'
+[Device A]
+mac=AA:AA:AA:AA:AA:AA
+type=esp32
+
+[Device B]
+mac=BB:BB:BB:BB:BB:BB
+type=esp32
+
+[Device C]
+mac=CC:CC:CC:CC:CC:CC
+type=esp32
+EOF
+    mock_uhubctl << 'EOF'
+Current status for hub 20-4 [0000:0000, USB 2.10, 4 ports, ppps]
+  Port 1: 0103 power enable connect [303a:1001 Espressif USB JTAG AA:AA:AA:AA:AA:AA]
+  Port 2: 0103 power enable connect [303a:1001 Espressif USB JTAG BB:BB:BB:BB:BB:BB]
+  Port 3: 0103 power enable connect [303a:1001 Espressif USB JTAG CC:CC:CC:CC:CC:CC]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+BB:BB:BB:BB:BB:BB|/dev/cu.usbmodem102|20-4.2
+CC:CC:CC:CC:CC:CC|/dev/cu.usbmodem103|20-4.3
+EOF
+
+    # Lock Device A
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=someone
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=testing
+TTL=1800
+EOF
+
+    run "$USB_DEVICE" find --available "Device"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"name: Device B"* ]]
+    [[ "$output" == *"lock: available"* ]]
+}
+
+@test "find --available: fails when all locked" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+    mock_uhubctl << 'EOF'
+Current status for hub 20-4 [0000:0000, USB 2.10, 4 ports, ppps]
+  Port 1: 0103 power enable connect [303a:1001 Espressif USB JTAG AA:AA:AA:AA:AA:AA]
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+EOF
+
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=blocker
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=blocking
+TTL=1800
+EOF
+
+    run "$USB_DEVICE" find --available "Device A"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"No available devices"* ]]
 }
 
 @test "INI: hub_name= shown in find output" {

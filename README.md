@@ -62,7 +62,8 @@ Manage named USB devices via uhubctl and pyserial. Device names support fuzzy ma
 usb-device list                    # show all registered devices and their status
 usb-device scan                    # scan bus, update last-known locations
 usb-device check                   # verify all dependencies are installed
-usb-device find "1.9"              # show hub/port/serial info + supported commands
+usb-device find "1.9"              # show hub/port/serial info + lock status
+usb-device find --available "MPCB" # first connected+unlocked match
 usb-device type "1.9"              # print device type (for scripting)
 usb-device port "1.9"              # print /dev/cu.* path (for scripts)
 usb-device reset "1.9"             # power-cycle (escalates port → hub)
@@ -71,8 +72,10 @@ usb-device off "1.9"               # turn off power
 usb-device on "1.9"                # turn on power
 usb-device bootloader "1.9"        # enter bootloader (requires type plugin)
 usb-device boot "1.9"              # exit bootloader (requires type plugin)
-usb-device checkout "1.9"          # acquire exclusive access
-usb-device checkin "1.9"           # release exclusive access
+usb-device checkout "1.9"          # acquire exclusive access (owned by caller)
+usb-device checkout --any "MPCB"   # first available matching device
+usb-device checkin "1.9"           # release (only if you own it)
+usb-device checkin --mine           # release all your locks
 usb-device locks                   # show all checked-out devices
 usb-device version                 # print version
 ```
@@ -105,16 +108,27 @@ When `reset` is called:
 
 ### Device locking
 
-Exclusive access for CI jobs and manual use:
+Exclusive access for CI jobs and development sessions:
 
 ```bash
-usb-device checkout "1.9"                           # acquire lock
-usb-device checkout --wait --timeout 60 "1.9"       # wait up to 60s
-usb-device checkout --owner ci-job --purpose "PR 42" --ttl 600 "1.9"
-usb-device checkin "1.9"                             # release
-usb-device checkin -f "1.9"                          # force release
+usb-device checkout "1.9"                           # acquire lock (owned by caller's PID)
+usb-device checkout --any "MPCB"                    # first available matching device
+usb-device checkout --wait --timeout 60 "1.9"       # wait up to 60s if busy
+usb-device checkout --purpose "PR 42" --ttl 600 "1.9"  # with metadata
+usb-device checkin "1.9"                             # release (only if you own it)
+usb-device checkin --mine                            # release all your locks
+usb-device checkin -f "1.9"                          # force release anyone's lock
 usb-device locks                                     # list all locks
+usb-device find --available "MPCB"                   # first connected+unlocked match
 ```
+
+**Ownership**: Locks are owned by the caller's process (`$PPID`). Checkout from the same terminal session or CI job is re-entrant — it refreshes the lock instead of failing. Use `--pid PID` to delegate ownership to a specific process.
+
+**Safety**: `checkin` only releases locks you own. Releasing another session's lock requires `-f`. Bare `checkin` with no args requires `--mine` to prevent accidental release-all.
+
+**`--any`**: Finds the first available device matching a pattern, skipping locked and offline devices. Prints structured output (`DEVICE_NAME`, `DEVICE_PORT`, `DEVICE_TYPE`) to stdout for script consumption.
+
+**`--shared`**: Joins an existing lock held by the same owner without modifying it (exit code 2). Useful for composable scripts where a parent holds the lock and children need to verify access.
 
 Locks are advisory — mutating commands (`reset`, `off`, `on`, `bootloader`, `boot`) warn if a device is checked out by another process. Stale locks auto-reclaim via PID liveness and TTL expiry.
 
