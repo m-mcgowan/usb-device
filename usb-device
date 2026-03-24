@@ -842,24 +842,27 @@ EOF
 
 # Print checkout result to stdout (structured, for script consumption).
 _print_checkout_result() {
-    local port=""
+    local port="" bl_port=""
     if [ -n "$RESOLVED_MAC" ]; then
         port=$(find_serial_port "$RESOLVED_MAC")
+        _resolve_bootloader_port 2>/dev/null
+        bl_port="${RESOLVED_BOOTLOADER_PORT:-$port}"
     fi
 
     if [ "${_checkout_export:-0}" -eq 1 ]; then
         # Shell-eval format: sets up the terminal for PIO + serial-monitor
-        # pio-labgrid reads this to know which device is reserved
         echo "export PIO_LABGRID_DEVICE='$RESOLVED_NAME'"
-        # PIO reads PLATFORMIO_UPLOAD_PORT to override upload_port in INI
-        [ -n "$port" ] && echo "export PLATFORMIO_UPLOAD_PORT='$port'"
-        # Generic vars for scripts/tools (serial-monitor, run_tests.sh, etc.)
+        # Upload port = bootloader port (PIO uploads to bootloader)
+        [ -n "$bl_port" ] && echo "export PLATFORMIO_UPLOAD_PORT='$bl_port'"
+        # Runtime port for test/monitor/serial-monitor
         echo "export DEVICE_NAME='$RESOLVED_NAME'"
         [ -n "$port" ] && echo "export DEVICE_PORT='$port'"
+        [ -n "$bl_port" ] && [ "$bl_port" != "$port" ] && echo "export DEVICE_BOOTLOADER_PORT='$bl_port'"
     else
         # Structured key=value format
         echo "DEVICE_NAME='$RESOLVED_NAME'"
         [ -n "$port" ] && echo "DEVICE_PORT='$port'"
+        [ -n "$bl_port" ] && [ "$bl_port" != "$port" ] && echo "DEVICE_BOOTLOADER_PORT='$bl_port'"
         echo "DEVICE_TYPE='$RESOLVED_TYPE'"
     fi
 }
@@ -1106,7 +1109,7 @@ Commands:
   reset [-f|--force] <name>     Power-cycle a device (escalates to hub if needed)
   off <name>                    Turn off power to a device
   on <name>                     Turn on power to a device
-  port <name>                   Print /dev/cu.* path
+  port [-b|--bootloader] <name> Print /dev/cu.* path (--bootloader for upload port)
   env <name>                    Print shell exports for PIO (eval-able)
   bootloader <name>             Enter bootloader (requires type plugin)
   boot <name>                   Exit bootloader (requires type plugin)
@@ -1738,21 +1741,60 @@ dispatch_type_action() {
 }
 
 cmd_port() {
-    resolve_device "$1"
-    require_serial_port
-    echo "$RESOLVED_PORT"
+    local bootloader=0
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            --bootloader|-b) bootloader=1; shift ;;
+            *)               die "unknown flag: $1" ;;
+        esac
+    done
+    # resolve_device unless already resolved (chained mode)
+    if [ -n "${1:-}" ]; then
+        resolve_device "$1"
+    elif [ -z "$RESOLVED_NAME" ]; then
+        die "usage: usb-device port [-b|--bootloader] <name>"
+    fi
+    if [ "$bootloader" -eq 1 ]; then
+        _resolve_bootloader_port || die "no bootloader port found for '$RESOLVED_NAME'"
+        echo "$RESOLVED_BOOTLOADER_PORT"
+    else
+        require_serial_port
+        echo "$RESOLVED_PORT"
+    fi
+}
+
+# Resolve the bootloader port for the current device.
+# Uses bootloader_mac field from devices.conf if present, otherwise falls back
+# to the runtime port (same MAC). Sets RESOLVED_BOOTLOADER_PORT.
+# Returns 1 if port can't be resolved.
+_resolve_bootloader_port() {
+    RESOLVED_BOOTLOADER_PORT=""
+    local bl_mac
+    bl_mac=$(cmd_field "$RESOLVED_NAME" "bootloader_mac" 2>/dev/null) || true
+    if [ -n "$bl_mac" ]; then
+        RESOLVED_BOOTLOADER_PORT=$(find_serial_port "$bl_mac")
+        [ -n "$RESOLVED_BOOTLOADER_PORT" ] || return 1
+    elif [ -n "$RESOLVED_MAC" ]; then
+        RESOLVED_BOOTLOADER_PORT=$(find_serial_port "$RESOLVED_MAC")
+        [ -n "$RESOLVED_BOOTLOADER_PORT" ] || return 1
+    else
+        return 1
+    fi
 }
 
 cmd_env() {
     resolve_device "$1"
-    local port=""
+    local port="" bl_port=""
     if [ -n "$RESOLVED_MAC" ]; then
         port=$(find_serial_port "$RESOLVED_MAC")
+        _resolve_bootloader_port 2>/dev/null
+        bl_port="${RESOLVED_BOOTLOADER_PORT:-$port}"
     fi
     echo "export PIO_LABGRID_DEVICE='$RESOLVED_NAME'"
-    [ -n "$port" ] && echo "export PLATFORMIO_UPLOAD_PORT='$port'"
+    [ -n "$bl_port" ] && echo "export PLATFORMIO_UPLOAD_PORT='$bl_port'"
     echo "export DEVICE_NAME='$RESOLVED_NAME'"
     [ -n "$port" ] && echo "export DEVICE_PORT='$port'"
+    [ -n "$bl_port" ] && [ "$bl_port" != "$port" ] && echo "export DEVICE_BOOTLOADER_PORT='$bl_port'"
 }
 
 # ── Type-dispatched commands ───────────────────────────────────────
@@ -1931,7 +1973,7 @@ dispatch_cmd() {
         reset)      cmd_reset "$@" ;;
         off)        cmd_off "${1:-$RESOLVED_NAME}" ;;
         on)         cmd_on "${1:-$RESOLVED_NAME}" ;;
-        port)       cmd_port "${1:-$RESOLVED_NAME}" ;;
+        port)       cmd_port "$@" ;;
         env)        cmd_env "${1:-$RESOLVED_NAME}" ;;
         bootloader) cmd_bootloader "${1:-$RESOLVED_NAME}" ;;
         boot)       cmd_boot "${1:-$RESOLVED_NAME}" ;;
@@ -1959,7 +2001,7 @@ if is_command "$1"; then
     # Traditional: usb-device <command> [flags] <device>
     cmd="$1"; shift
     case "$cmd" in
-        reset|checkout|checkin|find|field) dispatch_cmd "$cmd" "$@" ;;
+        reset|checkout|checkin|find|field|port) dispatch_cmd "$cmd" "$@" ;;
         *)
             [ -n "${1:-}" ] || die "usage: usb-device $cmd <name>"
             dispatch_cmd "$cmd" "$1"

@@ -1140,6 +1140,56 @@ EOF
     [ -d "$TEST_DIR/locks/device_c" ]
 }
 
+@test "port --bootloader: uses bootloader_mac when configured" {
+    cat > "$CONF" << 'EOF'
+[Hub Device]
+mac=AA:AA:AA:AA:AA:AA
+type=insight_hub
+bootloader_mac=BB:BB:BB:BB:BB:BB
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+BB:BB:BB:BB:BB:BB|/dev/cu.usbmodem201|20-4.2
+EOF
+
+    run "$USB_DEVICE" port "Hub Device"
+    [ "$status" -eq 0 ]
+    [ "$output" = "/dev/cu.usbmodem101" ]
+
+    run "$USB_DEVICE" port --bootloader "Hub Device"
+    [ "$status" -eq 0 ]
+    [ "$output" = "/dev/cu.usbmodem201" ]
+}
+
+@test "port --bootloader: falls back to runtime port" {
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+EOF
+
+    run "$USB_DEVICE" port --bootloader "Device A"
+    [ "$status" -eq 0 ]
+    [ "$output" = "/dev/cu.usbmodem101" ]
+}
+
+@test "env: includes bootloader port when different" {
+    cat > "$CONF" << 'EOF'
+[Hub Device]
+mac=AA:AA:AA:AA:AA:AA
+type=insight_hub
+bootloader_mac=BB:BB:BB:BB:BB:BB
+EOF
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+BB:BB:BB:BB:BB:BB|/dev/cu.usbmodem201|20-4.2
+EOF
+
+    run "$USB_DEVICE" env "Hub Device"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PLATFORMIO_UPLOAD_PORT='/dev/cu.usbmodem201'"* ]]
+    [[ "$output" == *"DEVICE_PORT='/dev/cu.usbmodem101'"* ]]
+    [[ "$output" == *"DEVICE_BOOTLOADER_PORT='/dev/cu.usbmodem201'"* ]]
+}
+
 @test "checkout --export: outputs shell exports" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
     mock_pyserial << 'EOF'
