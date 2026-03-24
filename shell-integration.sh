@@ -10,9 +10,9 @@ piodev() {
 }
 
 # Lock a device and set up the shell for PlatformIO.
-# Usage: devlock "1.10"          — lock a specific device
-#        devlock --any "MPCB"    — first available match
-devlock() {
+# Usage: piodevlock "1.10"          — lock a specific device
+#        piodevlock --any "MPCB"    — first available match
+piodevlock() {
     local output
     output=$(usb-device checkout --export "$@")
     local rc=$?
@@ -28,9 +28,9 @@ devlock() {
 }
 
 # Unlock devices and unset env vars.
-# Usage: devunlock              — unlock all devices held by this shell
-#        devunlock "1.10"       — unlock a specific device
-devunlock() {
+# Usage: piodevunlock              — unlock all devices held by this shell
+#        piodevunlock "1.10"       — unlock a specific device
+piodevunlock() {
     if [ $# -eq 0 ]; then
         usb-device checkin --mine
     else
