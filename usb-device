@@ -284,14 +284,25 @@ _resolve_from_index() {
     RESOLVED_HUB_NAME="${DEVICE_HUB_NAMES[$idx]}"
 }
 
+# Check if a device name is a partner device (contains ':').
+# Partner devices (e.g. "Board:ppk2") are excluded from fuzzy matching
+# unless the search pattern itself contains ':'.
+_is_partner_device() {
+    [[ "$1" == *:* ]]
+}
+
 # Find all device indices matching a pattern. Sets MATCH_INDICES array.
 # Returns 0 if any match found, 1 if none.
+# Partner devices (name contains ':') are excluded from fuzzy matches
+# unless the pattern itself contains ':'.
 _find_matching_indices() {
     local pattern="$1"
     MATCH_INDICES=()
     local i
+    local include_partners=0
+    [[ "$pattern" == *:* ]] && include_partners=1
 
-    # Exact match (case-insensitive) — return immediately
+    # Exact match (case-insensitive) — always considers all devices
     for i in "${!DEVICE_NAMES[@]}"; do
         if echo "${DEVICE_NAMES[$i]}" | grep -iqx "$pattern"; then
             MATCH_INDICES=("$i")
@@ -302,10 +313,12 @@ _find_matching_indices() {
     # Fuzzy match: regex if special chars detected, otherwise case-insensitive substring
     if is_regex "$pattern"; then
         for i in "${!DEVICE_NAMES[@]}"; do
+            [ "$include_partners" -eq 0 ] && _is_partner_device "${DEVICE_NAMES[$i]}" && continue
             echo "${DEVICE_NAMES[$i]}" | grep -iqE "$pattern" && MATCH_INDICES+=("$i")
         done
     else
         for i in "${!DEVICE_NAMES[@]}"; do
+            [ "$include_partners" -eq 0 ] && _is_partner_device "${DEVICE_NAMES[$i]}" && continue
             echo "${DEVICE_NAMES[$i]}" | grep -iqF "$pattern" && MATCH_INDICES+=("$i")
         done
     fi
