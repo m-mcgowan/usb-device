@@ -110,14 +110,13 @@ if [ -n "$SHELL_RC" ]; then
         echo "[updated] removed old ~/.config/usb-devices PATH entry"
     fi
 
-    # Add repo scripts path
-    PATH_COMMENT="# usb-device tools (from firmware repo)"
-    if grep -qF "scripts/usb-devices" "$SHELL_RC" 2>/dev/null; then
+    # Add repo scripts path (idempotent — check for SCRIPT_DIR already present)
+    if grep -qF "$SCRIPT_DIR" "$SHELL_RC" 2>/dev/null; then
         echo "[ok] PATH already configured in $SHELL_RC"
     else
         {
             echo ""
-            echo "$PATH_COMMENT"
+            echo "# usb-device tools"
             echo "export PATH=\"$SCRIPT_DIR:\$PATH\""
         } >> "$SHELL_RC"
         echo "[ok] added $SCRIPT_DIR to PATH in $SHELL_RC"
@@ -206,13 +205,9 @@ fi
 echo ""
 echo "=== Setup complete ==="
 echo ""
-echo "Quick start:"
-echo "  usb-device list                          # show all registered devices"
-echo "  usb-device scan                          # scan bus, update last-known locations"
-echo "  usb-device find \"<name>\"                  # show hub/port/dev info"
-echo "  usb-device reset \"<name>\"                 # power-cycle a device"
-echo "  usb-device port \"<name>\"                  # print /dev/cu.* path"
-echo "  serial-monitor \"<name>\"                   # serial monitor with reset/bootloader"
-echo "  usb-device hub install                   # install hub display agent (auto-start)"
+echo "Get started:"
+echo "  usb-device scan    # scan bus and locate devices"
+echo "  usb-device list    # show registered devices"
+echo "  usb-device help    # full command reference"
 echo ""
 echo "Device registry: $CONFIG_DIR/devices.conf"
