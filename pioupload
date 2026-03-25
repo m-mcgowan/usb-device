@@ -1,0 +1,23 @@
+#!/bin/bash
+# Upload firmware via PlatformIO to a named USB device.
+# Usage: pioupload [pio-args...] <device-name>
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+    echo "Usage: pioupload [pio-args...] <device-name>"
+    echo ""
+    echo "Upload firmware to a device. Last argument is the device name"
+    echo "(resolved by usb-device). All other arguments are passed to 'pio run'."
+    echo ""
+    echo "Examples:"
+    echo "  pioupload 1.10                        # default environment"
+    echo "  pioupload -e esp32s3-idf 1.10         # specific environment"
+    echo "  pioupload -e esp32s3-idf -v 1.10      # verbose"
+    exit 1
+fi
+
+dev="${@:$#}"
+args=("${@:1:$#-1}")
+bl_port=$(usb-device port --bootloader "$dev") || exit 1
+
+exec pio run -t upload --upload-port "$bl_port" "${args[@]}"

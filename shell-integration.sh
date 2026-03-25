@@ -39,38 +39,5 @@ piodevunlock() {
     unset PIO_LABGRID_DEVICE PLATFORMIO_UPLOAD_PORT DEVICE_NAME DEVICE_PORT
 }
 
-# PlatformIO build/test/monitor helpers.
-# Last argument is the device name for usb-device port resolution.
-# Usage: pioupload -e esp32s3-idf 1.10
-#        piotest -e esp32s3-idf -v 1.10
-#        piomonitor 1.10
-pioupload() {
-    if [ $# -lt 1 ]; then
-        echo "Usage: pioupload [pio-args...] <device-name>" >&2; return 1
-    fi
-    local dev="${!#}"
-    local bl_port; bl_port=$(usb-device port --bootloader "$dev") || return 1
-    local args=("${@:1:$#-1}")
-    pio run -t upload --upload-port "$bl_port" "${args[@]}"
-}
-
-piotest() {
-    if [ $# -lt 1 ]; then
-        echo "Usage: piotest [pio-args...] <device-name>" >&2; return 1
-    fi
-    local dev="${!#}"
-    local bl_port; bl_port=$(usb-device port --bootloader "$dev") || return 1
-    local port; port=$(usb-device port "$dev") || return 1
-    local args=("${@:1:$#-1}")
-    pio test --upload-port "$bl_port" --test-port "$port" "${args[@]}"
-}
-
-piomonitor() {
-    if [ $# -lt 1 ]; then
-        echo "Usage: piomonitor [args...] <device-name>" >&2; return 1
-    fi
-    local dev="${!#}"
-    local port; port=$(usb-device port "$dev") || return 1
-    local args=("${@:1:$#-1}")
-    serial-monitor "$port" "${args[@]}"
-}
+# PIO helpers (pioupload, piotest, piomonitor) are standalone bash scripts
+# in this directory, available on PATH.

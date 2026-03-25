@@ -1,0 +1,24 @@
+#!/bin/bash
+# Run PlatformIO tests on a named USB device.
+# Usage: piotest [pio-args...] <device-name>
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+    echo "Usage: piotest [pio-args...] <device-name>"
+    echo ""
+    echo "Build, upload, and run tests on a device. Last argument is the device"
+    echo "name (resolved by usb-device). All other arguments are passed to 'pio test'."
+    echo ""
+    echo "Examples:"
+    echo "  piotest 1.10                          # default environment"
+    echo "  piotest -e esp32s3-idf 1.10           # specific environment"
+    echo "  piotest -e esp32s3-idf -v 1.10        # verbose"
+    exit 1
+fi
+
+dev="${@:$#}"
+args=("${@:1:$#-1}")
+bl_port=$(usb-device port --bootloader "$dev") || exit 1
+port=$(usb-device port "$dev") || exit 1
+
+exec pio test --upload-port "$bl_port" --test-port "$port" "${args[@]}"
