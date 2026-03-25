@@ -45,7 +45,7 @@ piodevunlock() {
 #        piotest -e esp32s3-idf -v 1.10
 #        piomonitor 1.10
 pioupload() {
-    if [ $# -lt 2 ]; then
+    if [ $# -lt 1 ]; then
         echo "Usage: pioupload [pio-args...] <device-name>" >&2; return 1
     fi
     local dev="${!#}"
@@ -55,7 +55,7 @@ pioupload() {
 }
 
 piotest() {
-    if [ $# -lt 2 ]; then
+    if [ $# -lt 1 ]; then
         echo "Usage: piotest [pio-args...] <device-name>" >&2; return 1
     fi
     local dev="${!#}"
