@@ -110,8 +110,8 @@ if [ -n "$SHELL_RC" ]; then
         echo "[updated] removed old ~/.config/usb-devices PATH entry"
     fi
 
-    # Add repo scripts path (idempotent — check for SCRIPT_DIR already present)
-    if grep -qF "$SCRIPT_DIR" "$SHELL_RC" 2>/dev/null; then
+    # Add repo scripts path (idempotent — match expanded or unexpanded paths)
+    if grep -q 'usb-device.*PATH\|PATH.*usb-device' "$SHELL_RC" 2>/dev/null; then
         echo "[ok] PATH already configured in $SHELL_RC"
     else
         {

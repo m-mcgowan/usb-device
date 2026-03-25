@@ -45,6 +45,9 @@ piodevunlock() {
 #        piotest -e esp32s3-idf -v 1.10
 #        piomonitor 1.10
 pioupload() {
+    if [ $# -lt 2 ]; then
+        echo "Usage: pioupload [pio-args...] <device-name>" >&2; return 1
+    fi
     local dev="${!#}"
     local bl_port; bl_port=$(usb-device port --bootloader "$dev") || return 1
     local args=("${@:1:$#-1}")
@@ -52,6 +55,9 @@ pioupload() {
 }
 
 piotest() {
+    if [ $# -lt 2 ]; then
+        echo "Usage: piotest [pio-args...] <device-name>" >&2; return 1
+    fi
     local dev="${!#}"
     local bl_port; bl_port=$(usb-device port --bootloader "$dev") || return 1
     local port; port=$(usb-device port "$dev") || return 1
@@ -60,6 +66,9 @@ piotest() {
 }
 
 piomonitor() {
+    if [ $# -lt 1 ]; then
+        echo "Usage: piomonitor [args...] <device-name>" >&2; return 1
+    fi
     local dev="${!#}"
     local port; port=$(usb-device port "$dev") || return 1
     local args=("${@:1:$#-1}")
