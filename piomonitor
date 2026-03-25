@@ -19,4 +19,4 @@ dev="${@:$#}"
 args=("${@:1:$#-1}")
 port=$(usb-device port "$dev") || exit 1
 
-exec serial-monitor "$port" "${args[@]}"
+exec serial-monitor "$port" ${args[@]+"${args[@]}"}

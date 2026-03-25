@@ -20,4 +20,4 @@ dev="${@:$#}"
 args=("${@:1:$#-1}")
 bl_port=$(usb-device port --bootloader "$dev") || exit 1
 
-exec pio run -t upload --upload-port "$bl_port" "${args[@]}"
+exec pio run -t upload --upload-port "$bl_port" ${args[@]+"${args[@]}"}
