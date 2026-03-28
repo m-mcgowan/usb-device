@@ -2,10 +2,24 @@
 # Source this from your shell profile:
 #   source ~/e/usb-device/shell-integration.sh
 
+# Print usage and return 0 (caller should stop) if no args or --help/-h.
+_pio_fn_usage() {
+    local usage="usage: $1 <device-name>"
+    shift
+    if [ $# -eq 0 ]; then echo "$usage" >&2; return 0; fi
+    for arg in "$@"; do
+        case "$arg" in --help|-h) echo "$usage" >&2; return 0 ;; esac
+    done
+    return 1
+}
+
 # Set up PIO env vars for a device (no locking).
 # Usage: piodev "1.10"
 piodev() {
-    eval $(usb-device env "$1")
+    _pio_fn_usage piodev "$@" && return
+    local output
+    output=$(usb-device env "$1") || return $?
+    eval "$output"
     echo "Using: $DEVICE_NAME ($DEVICE_PORT)" >&2
 }
 
@@ -13,6 +27,7 @@ piodev() {
 # Usage: piodevlock "1.10"          — lock a specific device
 #        piodevlock --any "MPCB"    — first available match
 piodevlock() {
+    _pio_fn_usage piodevlock "$@" && return
     local output
     output=$(usb-device checkout --export "$@")
     local rc=$?
@@ -36,7 +51,7 @@ piodevunlock() {
     else
         usb-device checkin "$@"
     fi
-    unset PIO_LABGRID_DEVICE PLATFORMIO_UPLOAD_PORT DEVICE_NAME DEVICE_PORT
+    unset PIO_LABGRID_DEVICE PLATFORMIO_UPLOAD_PORT DEVICE_NAME DEVICE_PORT USB_DEVICE_LOCK_PID
 }
 
 # PIO helpers (pioupload, piotest, piomonitor) are standalone bash scripts

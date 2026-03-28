@@ -24,6 +24,24 @@ If you work with multiple USB dev boards, you know the pain:
 - **Device locking** — `checkout`/`checkin` for CI jobs with TTL, wait, and stale lock recovery
 - **[USB Insight Hub](https://www.crowdsupply.com/aerio-solutions/usb-insight-hub) integration** — per-port power control via serial API (since uhubctl doesn't work on the Renesas hub), plus auto-updating displays with device names and connection status
 
+### Tools at a glance
+
+| Tool | Type | Purpose |
+|------|------|---------|
+| `usb-device` | CLI | Manage named USB devices — find, reset, power, lock |
+| `serial-monitor` | CLI | Serial monitor with reset, bootloader, delayed send |
+| `pioupload` | Script | Upload firmware to a named device via PlatformIO |
+| `piotest` | Script | Build, upload, and run PIO tests on a named device |
+| `piomonitor` | Script | PlatformIO serial monitor for a named device |
+| `piosermon` | Script | serial-monitor wrapper for a named device |
+| `piorun` | Script | Chain multiple PIO operations under one device lock |
+| `piodev` | Shell fn | Set PIO env vars for a device (no locking) |
+| `piodevlock` | Shell fn | Lock a device and set PIO env vars |
+| `piodevunlock` | Shell fn | Unlock devices and unset env vars |
+
+All tools resolve device names via `usb-device`, so fuzzy matching works everywhere.
+Run any script with `--help` for usage details.
+
 ## Install
 
 ### Homebrew (recommended)
@@ -122,13 +140,31 @@ usb-device locks                                     # list all locks
 usb-device find --available "MPCB"                   # first connected+unlocked match
 ```
 
-**Ownership**: Locks are owned by the caller's process (`$PPID`). Checkout from the same terminal session or CI job is re-entrant — it refreshes the lock instead of failing. Use `--pid PID` to delegate ownership to a specific process.
+**Ownership**: Locks are owned by the caller's process (`$PPID`). Locks are re-entrant — checking out a device you already hold refreshes the lock instead of failing.
+
+Child processes automatically inherit the lock. `piodevlock` and `checkout --export` set `USB_DEVICE_LOCK_PID` in the environment, so scripts like `pioupload` can re-enter the lock without any extra flags:
+
+```bash
+piodevlock 1.10         # lock + set env vars (including USB_DEVICE_LOCK_PID)
+pioupload               # inherits lock — no device arg needed
+piotest                  # same — re-enters the lock
+piodevunlock             # release
+```
+
+To grant access to an unrelated process (different terminal, CI job), use `--shared` with a common `--owner`:
+
+```bash
+# Terminal A
+usb-device checkout --owner "ci-job-42" "Device A"
+# Terminal B
+usb-device checkout --shared --owner "ci-job-42" "Device A"
+```
+
+Use `--pid PID` to delegate ownership to a specific process.
 
 **Safety**: `checkin` only releases locks you own. Releasing another session's lock requires `-f`. Bare `checkin` with no args requires `--mine` to prevent accidental release-all.
 
 **`--any`**: Finds the first available device matching a pattern, skipping locked and offline devices. Prints structured output (`DEVICE_NAME`, `DEVICE_PORT`, `DEVICE_TYPE`) to stdout for script consumption.
-
-**`--shared`**: Joins an existing lock held by the same owner without modifying it (exit code 2). Useful for composable scripts where a parent holds the lock and children need to verify access.
 
 Locks are advisory — mutating commands (`reset`, `off`, `on`, `bootloader`, `boot`) warn if a device is checked out by another process. Stale locks auto-reclaim via PID liveness and TTL expiry.
 
@@ -212,13 +248,6 @@ port=/dev/cu.usbmodemXXXX
 location=20-3.3
 ```
 
-### Use with PlatformIO
-
-```bash
-pio run -t upload --upload-port $(usb-device port "1.9")
-pio test -e esp32s3-idf --upload-port $(usb-device port "1.9")
-```
-
 ## serial-monitor
 
 Serial monitor with device reset and bootloader support. Designed for both interactive (TTY) and non-interactive (scripts, CI) use.
@@ -260,6 +289,63 @@ Send data to the serial port after connecting. Use `\n` for newline. Prefix with
 - `--send '@0.5xhello\n'` — send `hello\n` after 0.5s delay
 
 Multiple `--send` flags are processed sequentially, delays are relative to the previous send.
+
+## PlatformIO Workflow
+
+Standalone scripts and shell functions for PlatformIO development with named USB devices. All resolve ports via `usb-device` so you never pass raw `/dev/cu.*` paths.
+
+### Quick commands
+
+Last argument is always the device name. All other arguments pass through to PlatformIO.
+
+```bash
+pioupload 1.10                        # build + upload
+pioupload -e esp32s3-idf 1.10         # specific PIO environment
+piotest -e esp32s3-idf -v 1.10        # build + upload + run tests
+piomonitor 1.10                       # PlatformIO serial monitor
+piosermon 1.10                        # serial-monitor (Ctrl-R reset, Ctrl-B bootloader)
+```
+
+Each script acquires a device lock for the duration, resolves the correct port (bootloader for uploads, runtime for monitoring), and logs output to `logs/`.
+
+### Chaining operations
+
+`piorun` holds a single lock across multiple operations:
+
+```bash
+piorun 1.10 upload monitor            # upload then monitor
+piorun 1.10 upload test               # upload then test
+piorun 1.10 -e esp32s3-idf upload monitor   # with PIO environment
+```
+
+Commands: `upload`, `test`, `monitor`, `sermon`.
+
+### Shell functions
+
+For interactive terminal sessions where you want PIO env vars set in your shell. Source `shell-integration.sh` from your shell profile (done automatically by `setup.sh`):
+
+```bash
+piodevlock "1.10"                     # lock device + export env vars
+pio run -t upload                     # uses $PLATFORMIO_UPLOAD_PORT automatically
+serial-monitor "$DEVICE_NAME"         # uses $DEVICE_NAME
+piodevunlock                          # release lock + unset vars
+
+piodev "1.10"                         # set env vars without locking
+piodevlock --any "MPCB"              # lock first available match
+```
+
+Exported variables: `PLATFORMIO_UPLOAD_PORT`, `DEVICE_PORT`, `DEVICE_NAME`, `PIO_LABGRID_DEVICE`.
+
+### Raw port access
+
+For cases where you need the port path directly:
+
+```bash
+pio run -t upload --upload-port $(usb-device port --bootloader "1.9")
+pio test --upload-port $(usb-device port --bootloader "1.9") --test-port $(usb-device port "1.9")
+```
+
+See [docs/pio-integration.md](docs/pio-integration.md) for advanced topics (pio-labgrid locking, port precedence, hardware power management).
 
 ## Configuration
 

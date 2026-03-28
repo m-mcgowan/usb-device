@@ -1044,6 +1044,68 @@ EOF
     [ "$status" -eq 0 ]
 }
 
+@test "checkout: re-entrant — ancestor PID inherits lock" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Create a lock owned by an ancestor (grandparent PPID of the usb-device process)
+    # When bats runs usb-device, the process tree is:
+    #   bats ($$) → bash (subshell) → usb-device ($PPID = bash)
+    # Lock with bats PID ($$), which is an ancestor of usb-device's $PPID.
+    # Owner must match the caller's default (whoami@hostname) for ancestor re-entrancy.
+    local default_owner="$(whoami)@$(hostname -s)"
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$$
+OWNER=$default_owner
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=parent session
+TTL=3600
+EOF
+
+    # Checkout from child process should succeed (ancestor re-entrant)
+    run "$USB_DEVICE" checkout --purpose "child task" "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Refreshed lock"* ]]
+
+    # Lock should have updated purpose
+    run grep "^PURPOSE=child task" "$TEST_DIR/locks/device_a/info"
+    [ "$status" -eq 0 ]
+}
+
+@test "checkout: re-entrant — USB_DEVICE_LOCK_PID env var" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Spawn a background process to hold the lock (not an ancestor)
+    sleep 300 &
+    local holder_pid=$!
+
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$holder_pid
+OWNER=test
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=parent session
+TTL=3600
+EOF
+
+    # With USB_DEVICE_LOCK_PID set, child process can re-enter
+    USB_DEVICE_LOCK_PID=$holder_pid run "$USB_DEVICE" checkout --purpose "child task" "Device A"
+    kill $holder_pid 2>/dev/null || true
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Refreshed lock"* ]]
+}
+
+@test "checkout --export: includes USB_DEVICE_LOCK_PID" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-4.1
+EOF
+
+    run "$USB_DEVICE" checkout --export "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"USB_DEVICE_LOCK_PID="* ]]
+}
+
 @test "checkout: --pid stores explicit PID" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 
@@ -1054,14 +1116,17 @@ EOF
     [ "$status" -eq 0 ]
 }
 
-@test "checkout --shared: joins lock held by same owner" {
+@test "checkout --shared: joins lock held by same owner (non-ancestor)" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 
-    # Create a lock held by the default owner (whoami@hostname)
+    # Spawn a background process that's alive but not an ancestor
+    sleep 300 &
+    local other_pid=$!
+
     local owner="$(whoami)@$(hostname -s)"
     mkdir -p "$TEST_DIR/locks/device_a"
     cat > "$TEST_DIR/locks/device_a/info" <<EOF
-PID=$PPID
+PID=$other_pid
 OWNER=$owner
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PURPOSE=terminal session
@@ -1069,6 +1134,7 @@ TTL=3600
 EOF
 
     run "$USB_DEVICE" checkout --shared "Device A"
+    kill $other_pid 2>/dev/null || true
     [ "$status" -eq 2 ]
     [[ "$output" == *"Sharing lock"* ]]
 
@@ -1926,4 +1992,95 @@ EOF
     # DB should be populated
     run jq -r '.["Scan Board"].hub' "$DB"
     [ "$output" = "20-2" ]
+}
+
+# ── Checkout: fuzzy match should filter locked devices ────────────
+
+@test "checkout: fuzzy match skips locked devices in selection" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Lock Device A (alive PID so it won't be reclaimed)
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=someone
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=testing
+TTL=999999
+EOF
+
+    # "Device" matches A, B, C — pipe "1" as selection input
+    run bash -c 'echo 1 | "$1" checkout "$2"' _ "$USB_DEVICE" "Device"
+    [ "$status" -eq 0 ]
+
+    # Should have checked out Device B (first unlocked), not Device A
+    [[ "$output" == *"Checked out 'Device B'"* ]]
+    [ -d "$TEST_DIR/locks/device_b" ]
+}
+
+@test "checkout: shows locked devices before menu" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Lock Device A
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=someone
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=testing
+TTL=999999
+EOF
+
+    # "Device" matches A, B, C — pipe "1" as selection
+    run bash -c 'echo 1 | "$1" checkout "$2"' _ "$USB_DEVICE" "Device"
+    [ "$status" -eq 0 ]
+
+    # Locked device should be shown as locked (not in the numbered menu)
+    [[ "$output" == *"Device A"* ]]
+    [[ "$output" == *"locked"* ]] || [[ "$output" == *"LOCKED"* ]]
+}
+
+@test "checkout: auto-selects when only one device unlocked" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Lock Device A and Device B
+    for dev in device_a device_b; do
+        mkdir -p "$TEST_DIR/locks/$dev"
+        cat > "$TEST_DIR/locks/$dev/info" <<EOF
+PID=$PPID
+OWNER=someone
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=testing
+TTL=999999
+EOF
+    done
+
+    # "Device" matches A, B, C — should auto-select C (only unlocked)
+    run "$USB_DEVICE" checkout "Device"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Checked out 'Device C'"* ]]
+    [ -d "$TEST_DIR/locks/device_c" ]
+}
+
+@test "checkout: fails with message when all fuzzy matches locked" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Lock all three devices
+    for dev in device_a device_b device_c; do
+        mkdir -p "$TEST_DIR/locks/$dev"
+        cat > "$TEST_DIR/locks/$dev/info" <<EOF
+PID=$PPID
+OWNER=someone
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=testing
+TTL=999999
+EOF
+    done
+
+    run "$USB_DEVICE" checkout "Device"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"locked"* ]] || [[ "$output" == *"LOCKED"* ]]
+
+    # Should not show spurious "checked out" message for empty device name
+    [[ "$output" != *"Device '' is checked out"* ]]
 }

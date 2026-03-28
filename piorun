@@ -1,0 +1,87 @@
+#!/bin/bash
+# Run multiple PIO operations on a device under a single lock.
+# Usage: piorun <device-name> <command> [command ...]
+#
+# Commands: upload, test, monitor, sermon
+# Extra args can be passed per-command with -- separators.
+set -euo pipefail
+source "$(dirname "$0")/pio-common.sh"
+
+show_usage() {
+    echo "Usage: piorun <device-name> <command> [command ...]"
+    echo ""
+    echo "Run multiple PIO operations under a single device lock."
+    echo "Commands: upload, test, monitor, sermon"
+    echo ""
+    echo "Examples:"
+    echo "  piorun 1.10 upload monitor                  # upload then monitor"
+    echo "  piorun 1.10 upload test                     # upload then test"
+    echo "  piorun 1.10 test monitor                    # test then monitor"
+    echo "  piorun 1.10 -e esp32s3-idf upload monitor   # with PIO env"
+}
+
+pio_check_help "$@" && { show_usage; exit 0; }
+
+# If first arg isn't a flag and we have 2+ args, it's a device name.
+# Otherwise fall back to DEVICE_NAME env var (set by piodevlock).
+if [ $# -lt 1 ]; then
+    show_usage >&2
+    exit 1
+elif [ $# -ge 2 ] && [[ "$1" != -* ]]; then
+    dev="$1"; shift
+elif [ -n "${DEVICE_NAME:-}" ]; then
+    dev="$DEVICE_NAME"
+else
+    show_usage >&2
+    exit 1
+fi
+
+# Collect any flags (like -e esp32s3-idf -v) before commands
+pio_args=()
+while [[ $# -gt 0 && "$1" == -* ]]; do
+    pio_args+=("$1")
+    shift
+    # Flags with values (-e env, -d dir, etc.)
+    if [[ $# -gt 0 && ! "$1" == -* && "${pio_args[-1]}" =~ ^-[edcf]$ ]]; then
+        pio_args+=("$1")
+        shift
+    fi
+done
+
+commands=("$@")
+if [ ${#commands[@]} -eq 0 ]; then
+    echo "error: at least one command required (upload, test, monitor, sermon)" >&2
+    exit 1
+fi
+
+PIO_DEV="$dev"
+pio_lock "$PIO_DEV" "piorun: ${commands[*]}" || exit 1
+trap pio_cleanup EXIT
+
+bl_port=$(usb-device port --bootloader "$PIO_DEV") || exit 1
+port=$(usb-device port "$PIO_DEV") || exit 1
+
+for cmd in "${commands[@]}"; do
+    case "$cmd" in
+        upload)
+            pio_log_setup upload
+            pio_exec pio run -t upload --upload-port "$bl_port" ${pio_args[@]+"${pio_args[@]}"} || exit $?
+            ;;
+        test)
+            pio_log_setup test
+            pio_exec pio test --upload-port "$bl_port" --test-port "$port" ${pio_args[@]+"${pio_args[@]}"} || exit $?
+            ;;
+        monitor)
+            pio_log_setup monitor
+            pio_exec pio device monitor --port "$port" --baud 115200 --eol LF ${pio_args[@]+"${pio_args[@]}"} || exit $?
+            ;;
+        sermon)
+            pio_log_setup sermon
+            pio_exec serial-monitor "$port" || exit $?
+            ;;
+        *)
+            echo "error: unknown command '$cmd' (expected: upload, test, monitor, sermon)" >&2
+            exit 1
+            ;;
+    esac
+done

@@ -120,12 +120,22 @@ if [ -n "$SHELL_RC" ]; then
             echo "export PATH=\"$SCRIPT_DIR:\$PATH\""
         } >> "$SHELL_RC"
         echo "[ok] added $SCRIPT_DIR to PATH in $SHELL_RC"
-        echo "     run: source $SHELL_RC"
+    fi
+
+    # Source shell-integration for piodevlock/piodevunlock/piodev functions
+    if grep -q 'shell-integration\.sh' "$SHELL_RC" 2>/dev/null; then
+        echo "[ok] shell-integration.sh already sourced in $SHELL_RC"
+    else
+        {
+            echo "source \"$SCRIPT_DIR/shell-integration.sh\""
+        } >> "$SHELL_RC"
+        echo "[ok] added shell-integration.sh to $SHELL_RC"
     fi
 else
     echo "[note] could not find .zshrc or .bashrc"
     echo "       manually add to your shell profile:"
     echo "       export PATH=\"$SCRIPT_DIR:\$PATH\""
+    echo "       source \"$SCRIPT_DIR/shell-integration.sh\""
 fi
 
 # ── 4. User config directory ────────────────────────────────────
@@ -204,10 +214,22 @@ fi
 
 echo ""
 echo "=== Setup complete ==="
+if [ -n "$SHELL_RC" ]; then
+    echo ""
+    echo "To activate in this terminal:"
+    echo "  source $SHELL_RC"
+    echo ""
+    echo "New terminal sessions will load these automatically."
+fi
 echo ""
-echo "Get started:"
+echo "Quick start:"
 echo "  usb-device scan    # scan bus and locate devices"
 echo "  usb-device list    # show registered devices"
 echo "  usb-device help    # full command reference"
+echo ""
+echo "Shell functions (via shell-integration.sh):"
+echo "  piodevlock <name>  # lock a device and set PIO env vars"
+echo "  piodevunlock       # unlock and clear env vars"
+echo "  piodev <name>      # set PIO env vars (no locking)"
 echo ""
 echo "Device registry: $CONFIG_DIR/devices.conf"

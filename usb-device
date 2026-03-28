@@ -351,6 +351,44 @@ resolve_device() {
         return 0
     fi
 
+    # In checkout mode, partition matches into locked/unlocked
+    local available_indices=()
+    local locked_indices=()
+    if [ "${_RESOLVE_CHECKOUT_MODE:-0}" -eq 1 ]; then
+        mkdir -p "$LOCK_DIR"
+        for i in "${MATCH_INDICES[@]}"; do
+            if _is_locked "${DEVICE_NAMES[$i]}"; then
+                locked_indices+=("$i")
+            else
+                available_indices+=("$i")
+            fi
+        done
+
+        # Show locked devices first
+        if [ ${#locked_indices[@]} -gt 0 ]; then
+            for i in "${locked_indices[@]}"; do
+                local lock_owner="${LOCK_OWNER:-?}"
+                local lock_purpose="${LOCK_PURPOSE:+ ($LOCK_PURPOSE)}"
+                echo "  ${DEVICE_NAMES[$i]} — locked by ${lock_owner}${lock_purpose}" >&2
+            done
+        fi
+
+        # All locked — fail
+        if [ ${#available_indices[@]} -eq 0 ]; then
+            echo "All devices matching '$pattern' are locked" >&2
+            return 1
+        fi
+
+        # Single unlocked device — auto-select
+        if [ ${#available_indices[@]} -eq 1 ]; then
+            _resolve_from_index "${available_indices[0]}"
+            return 0
+        fi
+
+        # Replace MATCH_INDICES with only available devices
+        MATCH_INDICES=("${available_indices[@]}")
+    fi
+
     # Multiple matches — interactive selection
     echo "Multiple devices match '$pattern':" >&2
     local i
@@ -644,6 +682,25 @@ _format_local_time() {
         date -d "@$epoch" "+%a %H:%M" 2>/dev/null
 }
 
+# Check if target_pid is an ancestor of child_pid (walks the process tree).
+_is_ancestor_pid() {
+    local target_pid="$1" child_pid="$2"
+    local current="$child_pid"
+    # Walk up the process tree (limit depth to avoid infinite loops)
+    local depth=0
+    while [ "$depth" -lt 20 ]; do
+        local parent
+        parent=$(ps -o ppid= -p "$current" 2>/dev/null | tr -d ' ') || return 1
+        [ -n "$parent" ] || return 1
+        [ "$parent" = "$target_pid" ] && return 0
+        # Reached init/launchd — stop
+        [ "$parent" = "1" ] || [ "$parent" = "0" ] && return 1
+        current="$parent"
+        depth=$((depth + 1))
+    done
+    return 1
+}
+
 # Check if a lock is stale and reclaim it if so. Returns 0 if reclaimed/absent.
 _try_reclaim_lock() {
     local lock_path="$1"
@@ -723,11 +780,12 @@ _show_lock_holder() {
 _checkout_one() {
     local name="$1" owner="$2" purpose="$3" ttl="$4" wait="$5" deadline="$6"
 
-    resolve_device "$name"
+    resolve_device "$name" || return 1
     local lock_path
     lock_path=$(_lock_path "$RESOLVED_NAME")
 
-    local my_pid="${_lock_pid:-$PPID}"
+    # Lock PID precedence: explicit --pid, inherited env var, parent PID
+    local my_pid="${_lock_pid:-${USB_DEVICE_LOCK_PID:-$PPID}}"
 
     while true; do
         _try_reclaim_lock "$lock_path"
@@ -744,19 +802,31 @@ EOF
             return 0
         fi
 
-        # Re-entrant: if we already hold the lock, refresh it
+        # Re-entrant: same PID, inherited env var, or ancestor process.
+        # Ancestor re-entrancy also requires matching owner to prevent
+        # unrelated ancestor processes from claiming the lock.
         local lock_pid
         lock_pid=$(_lock_field "$lock_path" "PID")
-        if [ -n "$lock_pid" ] && [ "$lock_pid" = "$my_pid" ]; then
-            cat > "$lock_path/info" <<EOF
+        if [ -n "$lock_pid" ]; then
+            local is_reentrant=0
+            if [ "$lock_pid" = "$my_pid" ]; then
+                is_reentrant=1
+            elif _is_ancestor_pid "$lock_pid" "$my_pid"; then
+                local lock_owner
+                lock_owner=$(_lock_field "$lock_path" "OWNER")
+                [ "$lock_owner" = "$owner" ] && is_reentrant=1
+            fi
+            if [ "$is_reentrant" -eq 1 ]; then
+                cat > "$lock_path/info" <<EOF
 PID=$my_pid
 OWNER=$owner
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PURPOSE=$purpose
 TTL=$ttl
 EOF
-            echo "Refreshed lock on '$RESOLVED_NAME'" >&2
-            return 0
+                echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+                return 0
+            fi
         fi
 
         # Shared: if same owner holds the lock, join without modifying
@@ -799,7 +869,7 @@ _checkout_any() {
         return 1
     fi
 
-    local my_pid="${_lock_pid:-$PPID}"
+    local my_pid="${_lock_pid:-${USB_DEVICE_LOCK_PID:-$PPID}}"
 
     for i in "${MATCH_INDICES[@]}"; do
         local name="${DEVICE_NAMES[$i]}"
@@ -830,20 +900,30 @@ EOF
             return 0
         fi
 
-        # Re-entrant: if we already hold the lock, refresh it
+        # Re-entrant: if we or an ancestor hold the lock, refresh it.
         local lock_pid
         lock_pid=$(_lock_field "$lock_path" "PID")
-        if [ -n "$lock_pid" ] && [ "$lock_pid" = "$my_pid" ]; then
-            cat > "$lock_path/info" <<EOF
+        if [ -n "$lock_pid" ]; then
+            local is_reentrant=0
+            if [ "$lock_pid" = "$my_pid" ]; then
+                is_reentrant=1
+            elif _is_ancestor_pid "$lock_pid" "$my_pid"; then
+                local lock_owner
+                lock_owner=$(_lock_field "$lock_path" "OWNER")
+                [ "$lock_owner" = "$owner" ] && is_reentrant=1
+            fi
+            if [ "$is_reentrant" -eq 1 ]; then
+                cat > "$lock_path/info" <<EOF
 PID=$my_pid
 OWNER=$owner
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PURPOSE=$purpose
 TTL=$ttl
 EOF
-            echo "Refreshed lock on '$RESOLVED_NAME'" >&2
-            _print_checkout_result
-            return 0
+                echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+                _print_checkout_result
+                return 0
+            fi
         fi
 
         echo "skip: '$name' — locked" >&2
@@ -862,6 +942,12 @@ _print_checkout_result() {
         bl_port="${RESOLVED_BOOTLOADER_PORT:-$port}"
     fi
 
+    # Read lock PID for re-entrant inheritance
+    local lock_pid=""
+    local lock_path
+    lock_path=$(_lock_path "$RESOLVED_NAME")
+    lock_pid=$(_lock_field "$lock_path" "PID")
+
     if [ "${_checkout_export:-0}" -eq 1 ]; then
         # Shell-eval format: sets up the terminal for PIO + serial-monitor
         echo "export PIO_LABGRID_DEVICE='$RESOLVED_NAME'"
@@ -871,6 +957,8 @@ _print_checkout_result() {
         echo "export DEVICE_NAME='$RESOLVED_NAME'"
         [ -n "$port" ] && echo "export DEVICE_PORT='$port'"
         [ -n "$bl_port" ] && [ "$bl_port" != "$port" ] && echo "export DEVICE_BOOTLOADER_PORT='$bl_port'"
+        # Lock PID for re-entrant child processes
+        [ -n "$lock_pid" ] && echo "export USB_DEVICE_LOCK_PID='$lock_pid'"
     else
         # Structured key=value format
         echo "DEVICE_NAME='$RESOLVED_NAME'"
@@ -910,6 +998,9 @@ cmd_checkout() {
         _checkout_any "$1" "$owner" "$purpose" "$ttl"
         return $?
     fi
+
+    # Tell resolve_device to filter locked devices from selection
+    _RESOLVE_CHECKOUT_MODE=1
 
     local deadline=0
     [ "$wait" -eq 1 ] && [ "$timeout" -gt 0 ] && deadline=$(( $(date +%s) + timeout ))
@@ -999,11 +1090,11 @@ cmd_checkin() {
         die "usage: usb-device checkin <name> [name ...] or usb-device checkin --mine"
     fi
 
-    # --mine: release all locks held by our PPID
+    # --mine: release all locks held by our PID (env var, explicit, or PPID)
     if [ "$mine" -eq 1 ]; then
         mkdir -p "$LOCK_DIR"
         parse_config
-        local my_pid="${_lock_pid:-$PPID}"
+        local my_pid="${_lock_pid:-${USB_DEVICE_LOCK_PID:-$PPID}}"
         local released=0
         for i in "${!DEVICE_NAMES[@]}"; do
             local name="${DEVICE_NAMES[$i]}"

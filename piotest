@@ -2,8 +2,9 @@
 # Run PlatformIO tests on a named USB device.
 # Usage: piotest [pio-args...] <device-name>
 set -euo pipefail
+source "$(dirname "$0")/pio-common.sh"
 
-if [ $# -lt 1 ]; then
+show_usage() {
     echo "Usage: piotest [pio-args...] <device-name>"
     echo ""
     echo "Build, upload, and run tests on a device. Last argument is the device"
@@ -13,12 +14,18 @@ if [ $# -lt 1 ]; then
     echo "  piotest 1.10                          # default environment"
     echo "  piotest -e esp32s3-idf 1.10           # specific environment"
     echo "  piotest -e esp32s3-idf -v 1.10        # verbose"
+}
+
+pio_check_help "$@" && { show_usage; exit 0; }
+
+if ! pio_parse_args "$@"; then
+    show_usage >&2
     exit 1
 fi
 
-dev="${@:$#}"
-args=("${@:1:$#-1}")
-bl_port=$(usb-device port --bootloader "$dev") || exit 1
-port=$(usb-device port "$dev") || exit 1
-
-exec pio test --upload-port "$bl_port" --test-port "$port" ${args[@]+"${args[@]}"}
+bl_port=$(usb-device port --bootloader "$PIO_DEV") || exit 1
+port=$(usb-device port "$PIO_DEV") || exit 1
+pio_lock "$PIO_DEV" "test" || exit 1
+trap pio_cleanup EXIT
+pio_log_setup test
+pio_exec pio test --upload-port "$bl_port" --test-port "$port" ${PIO_ARGS[@]+"${PIO_ARGS[@]}"}
