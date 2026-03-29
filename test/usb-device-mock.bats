@@ -945,6 +945,57 @@ EOF
     [[ "$output" == *"No devices are checked out"* ]]
 }
 
+@test "locks --mine: lists only devices locked by this session" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Lock Device A with our PID
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=test
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=mine
+TTL=3600
+EOF
+
+    # Lock Device B with a different PID (background process)
+    sleep 300 &
+    local other_pid=$!
+    mkdir -p "$TEST_DIR/locks/device_b"
+    cat > "$TEST_DIR/locks/device_b/info" <<EOF
+PID=$other_pid
+OWNER=other
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=theirs
+TTL=3600
+EOF
+
+    run env USB_DEVICE_LOCK_PID=$PPID "$USB_DEVICE" locks --mine
+    kill $other_pid 2>/dev/null || true
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Device A"* ]]
+    [[ "$output" != *"Device B"* ]]
+}
+
+@test "locks --mine: outputs bare device names" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=test
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=mine
+TTL=3600
+EOF
+
+    run env USB_DEVICE_LOCK_PID=$PPID "$USB_DEVICE" locks --mine
+    [ "$status" -eq 0 ]
+    # Should be bare name, no "LOCKED" decoration
+    [[ "$output" != *"LOCKED"* ]]
+    [ "$output" = "Device A" ]
+}
+
 @test "checkout: custom owner and purpose" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 

@@ -22,10 +22,10 @@ show_usage() {
 
 pio_check_help "$@" && { show_usage; exit 0; }
 
-if ! pio_parse_args "$@"; then
-    show_usage >&2
-    exit 1
-fi
+pio_parse_args "$@"
+rc=$?
+if [ "$rc" -eq 1 ]; then show_usage >&2; exit 1; fi
+[ "$rc" -eq 0 ] || exit "$rc"
 
 port=$(usb-device port "$PIO_DEV") || exit 1
 pio_lock "$PIO_DEV" "serial-monitor" || exit 1

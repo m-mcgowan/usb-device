@@ -23,17 +23,15 @@ show_usage() {
 pio_check_help "$@" && { show_usage; exit 0; }
 
 # If first arg isn't a flag and we have 2+ args, it's a device name.
-# Otherwise fall back to DEVICE_NAME env var (set by piodevlock).
+# Otherwise resolve from default/locked devices.
 if [ $# -lt 1 ]; then
     show_usage >&2
     exit 1
 elif [ $# -ge 2 ] && [[ "$1" != -* ]]; then
     dev="$1"; shift
-elif [ -n "${DEVICE_NAME:-}" ]; then
-    dev="$DEVICE_NAME"
 else
-    show_usage >&2
-    exit 1
+    _pio_resolve_device || { show_usage >&2; exit 1; }
+    dev="$PIO_DEV"
 fi
 
 # Collect any flags (like -e esp32s3-idf -v) before commands

@@ -28,15 +28,23 @@ piodev() {
 #        piodevlock --any "MPCB"    — first available match
 piodevlock() {
     _pio_fn_usage piodevlock "$@" && return
+    local had_default="${DEVICE_NAME:-}"
     local output
     output=$(usb-device checkout --export "$@")
     local rc=$?
     if [ $rc -eq 0 ]; then
+        # Always eval to get USB_DEVICE_LOCK_PID etc., but preserve existing default
+        local locked_name
+        locked_name=$(echo "$output" | grep "DEVICE_NAME=" | head -1 | sed "s/.*DEVICE_NAME='//;s/'.*//")
         eval "$output"
-        echo "Locked: $DEVICE_NAME" >&2
-        echo "  PIO_LABGRID_DEVICE=$PIO_LABGRID_DEVICE" >&2
-        echo "  PLATFORMIO_UPLOAD_PORT=$PLATFORMIO_UPLOAD_PORT" >&2
-        echo "  DEVICE_PORT=$DEVICE_PORT" >&2
+        if [ -n "$had_default" ]; then
+            # Restore the previous default
+            DEVICE_NAME="$had_default"
+        fi
+        echo "Locked: $locked_name" >&2
+        if [ -z "$had_default" ]; then
+            echo "  Default device: $DEVICE_NAME" >&2
+        fi
     else
         return $rc
     fi

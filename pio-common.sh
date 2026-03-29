@@ -12,20 +12,69 @@ pio_check_help() {
     return 1
 }
 
-# Parse arguments: last arg is device name, rest are pass-through.
-# Falls back to DEVICE_NAME env var (set by piodevlock) when no device arg given.
-# Sets: PIO_DEV, PIO_ARGS
-pio_parse_args() {
-    if [ $# -lt 1 ]; then
-        if [ -n "${DEVICE_NAME:-}" ]; then
-            PIO_DEV="$DEVICE_NAME"
-            PIO_ARGS=()
+# Resolve the default device when no device arg given. Sets PIO_DEV.
+# Resolution: DEVICE_NAME env → single locked device → prompt if interactive → error.
+# Returns: 0=resolved, 1=no devices, 2=ambiguous/error.
+_pio_resolve_device() {
+    # 1. Explicit default
+    if [ -n "${DEVICE_NAME:-}" ]; then
+        PIO_DEV="$DEVICE_NAME"
+        return 0
+    fi
+
+    # 2-3. Check locked devices in this session
+    local locked=()
+    while IFS= read -r name; do
+        [ -n "$name" ] && locked+=("$name")
+    done < <(usb-device locks --mine 2>/dev/null)
+
+    if [ ${#locked[@]} -eq 1 ]; then
+        PIO_DEV="${locked[0]}"
+        return 0
+    fi
+
+    if [ ${#locked[@]} -gt 1 ] && [ -t 0 ]; then
+        echo "Multiple devices locked — select one:" >&2
+        local i
+        for i in "${!locked[@]}"; do
+            echo "  $((i+1))) ${locked[$i]}" >&2
+        done
+        printf "Select [1-%d]: " "${#locked[@]}" >&2
+        local choice
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#locked[@]} ]; then
+            PIO_DEV="${locked[$((choice - 1))]}"
             return 0
         fi
-        return 1
+        echo "error: invalid selection" >&2
+        return 2
     fi
-    PIO_DEV="${@:$#}"
-    PIO_ARGS=("${@:1:$#-1}")
+
+    if [ ${#locked[@]} -gt 1 ]; then
+        echo "error: multiple devices locked — specify which one" >&2
+        return 2
+    fi
+
+    # No default and no locked devices
+    return 1
+}
+
+# Parse arguments: last arg is device name, rest are pass-through.
+# When no device arg given, resolves via:
+#   1. DEVICE_NAME env var (explicit default from piodev/piodevlock)
+#   2. Single locked device in this session (auto-select)
+#   3. Multiple locked devices + interactive TTY (prompt)
+#   4. Otherwise error
+# Sets: PIO_DEV, PIO_ARGS
+pio_parse_args() {
+    if [ $# -ge 1 ]; then
+        PIO_DEV="${@:$#}"
+        PIO_ARGS=("${@:1:$#-1}")
+        return 0
+    fi
+
+    PIO_ARGS=()
+    _pio_resolve_device || return $?
 }
 
 # Set up logging to logs/<prefix>-<datetime>.log
