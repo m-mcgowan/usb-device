@@ -2387,3 +2387,68 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == "notecard" ]]
 }
+
+# ── locks --prune ────────────────────────────────────────────────
+
+@test "locks --prune: removes stale locks with dead PIDs" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Create a lock with a dead PID
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=99999
+OWNER=dead-session
+TIMESTAMP=2026-01-01T00:00:00Z
+PURPOSE=stale
+TTL=0
+EOF
+
+    run "$USB_DEVICE" locks --prune
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Pruned 1 stale lock(s)"* ]]
+
+    # Lock dir should be gone
+    [ ! -d "$TEST_DIR/locks/device_a" ]
+}
+
+@test "locks --prune: reports no stale locks when all are live" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Create a lock with a live PID (bats runner)
+    local real_lstart
+    real_lstart=$(ps -p "$PPID" -o lstart= 2>/dev/null)
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=live-session
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=active
+TTL=0
+LSTART=$real_lstart
+COMM=bash
+EOF
+
+    run "$USB_DEVICE" locks --prune
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"No stale locks found"* ]]
+}
+
+@test "locks --prune: removes recycled PID locks" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Lock with live PID but wrong LSTART (recycled)
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=recycled-session
+TIMESTAMP=2026-01-01T00:00:00Z
+PURPOSE=stale
+TTL=0
+LSTART=Thu Jan  1 00:00:00 2026
+COMM=bash
+EOF
+
+    run "$USB_DEVICE" locks --prune
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Pruned 1 stale lock(s)"* ]]
+}

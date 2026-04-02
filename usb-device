@@ -1159,11 +1159,12 @@ cmd_checkin() {
 }
 
 cmd_locks() {
-    local mine=0
+    local mine=0 prune=0
     while [[ "${1:-}" == -* ]]; do
         case "$1" in
-            --mine) mine=1; shift ;;
-            *)      die "unknown flag: $1" ;;
+            --mine)  mine=1; shift ;;
+            --prune) prune=1; shift ;;
+            *)       die "unknown flag: $1" ;;
         esac
     done
 
@@ -1172,6 +1173,7 @@ cmd_locks() {
 
     local my_pid="${_lock_pid:-${USB_DEVICE_LOCK_PID:-$PPID}}"
     local has_locks=0
+    local pruned=0
     local i
     for i in "${!DEVICE_NAMES[@]}"; do
         local name="${DEVICE_NAMES[$i]}"
@@ -1181,6 +1183,7 @@ cmd_locks() {
         if [ -d "$lock_path" ]; then
             # Try to reclaim stale before displaying
             if _try_reclaim_lock "$lock_path"; then
+                pruned=$((pruned + 1))
                 continue  # was stale, now gone
             fi
 
@@ -1234,6 +1237,15 @@ cmd_locks() {
             printf "  %-30s  LOCKED  %s\n" "$name" "$detail"
         fi
     done
+
+    if [ "$prune" -eq 1 ]; then
+        if [ "$pruned" -gt 0 ]; then
+            echo "Pruned $pruned stale lock(s)."
+        else
+            echo "No stale locks found."
+        fi
+        return 0
+    fi
 
     if [ "$has_locks" -eq 0 ] && [ "$mine" -eq 0 ]; then
         echo "No devices are checked out."
@@ -1290,7 +1302,7 @@ Commands:
                                   --shared: join existing lock if same owner
   checkin [-f] <name> [...]     Release exclusive access (must own the lock)
   checkin --mine                Release all locks held by this session (requires flag)
-  locks [--mine]                Show checked-out devices (--mine: this session only)
+  locks [--mine|--prune]        Show checked-out devices (--mine: this session, --prune: remove stale)
   hub status                    Show Insight Hub channels and device assignments
   hub sync                      One-shot: push device names to hub displays
   hub watch                     Daemon: continuously update hub on connect/disconnect
