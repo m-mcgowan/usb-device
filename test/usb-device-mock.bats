@@ -2135,3 +2135,255 @@ EOF
     # Should not show spurious "checked out" message for empty device name
     [[ "$output" != *"Device '' is checked out"* ]]
 }
+
+# ── Lock metadata: LSTART, COMM, PID recycling ──────────────────
+
+@test "checkout: lock file contains LSTART and COMM" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    run "$USB_DEVICE" checkout "Device A"
+    [ "$status" -eq 0 ]
+
+    # LSTART should be present and non-empty (captures process start time)
+    run grep "^LSTART=" "$TEST_DIR/locks/device_a/info"
+    [ "$status" -eq 0 ]
+    [[ "$output" != "LSTART=" ]]  # not empty
+
+    # COMM should be present and non-empty (captures process name)
+    run grep "^COMM=" "$TEST_DIR/locks/device_a/info"
+    [ "$status" -eq 0 ]
+    [[ "$output" != "COMM=" ]]  # not empty
+}
+
+@test "checkout: default TTL is 0" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    run "$USB_DEVICE" checkout "Device A"
+    [ "$status" -eq 0 ]
+
+    run grep "^TTL=" "$TEST_DIR/locks/device_a/info"
+    [ "$status" -eq 0 ]
+    [ "$output" = "TTL=0" ]
+}
+
+@test "checkout: reclaims lock when PID is alive but start time differs (recycled PID)" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Create a lock owned by $PPID (bats runner, definitely alive)
+    # but with a fake LSTART that doesn't match the real process
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=old-session
+TIMESTAMP=2026-01-01T00:00:00Z
+PURPOSE=stale
+TTL=0
+LSTART=Thu Jan  1 00:00:00 2026
+COMM=bash
+EOF
+
+    run "$USB_DEVICE" checkout "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Reclaiming stale lock"* ]]
+    [[ "$output" == *"recycled"* ]]
+    [[ "$output" == *"Checked out"* ]]
+}
+
+@test "checkout: does not reclaim lock when PID is alive and start time matches" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Get real LSTART for $PPID
+    local real_lstart
+    real_lstart=$(ps -p "$PPID" -o lstart= 2>/dev/null)
+
+    # Create a lock owned by $PPID with the correct LSTART
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=other-user
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=active
+TTL=0
+LSTART=$real_lstart
+COMM=bash
+EOF
+
+    run "$USB_DEVICE" checkout "Device A"
+    [ "$status" -eq 1 ]
+    [[ "$output" != *"Reclaiming"* ]]
+    [[ "$output" == *"checked out"* ]]
+}
+
+@test "checkout: reclaims lock with dead PID even without LSTART (backwards compatible)" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Old-style lock file without LSTART/COMM fields
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=99999
+OWNER=old-tool
+TIMESTAMP=2026-01-01T00:00:00Z
+PURPOSE=legacy
+TTL=0
+EOF
+
+    run "$USB_DEVICE" checkout "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Reclaiming stale lock"* ]]
+    [[ "$output" == *"dead"* ]]
+    [[ "$output" == *"Checked out"* ]]
+}
+
+@test "locks: shows process name in output" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Create a lock owned by $PPID (bats runner, always alive) with real LSTART/COMM
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=test-user
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=testing
+TTL=0
+LSTART=$(ps -p "$PPID" -o lstart= 2>/dev/null)
+COMM=$(ps -p "$PPID" -o comm= 2>/dev/null)
+EOF
+
+    run "$USB_DEVICE" locks
+    [ "$status" -eq 0 ]
+    # pid field should include the process name in parentheses
+    [[ "$output" == *"pid="*"("*")"* ]]
+}
+
+# ── register --partner-of ────────────────────────────────────────
+
+@test "register: --partner-of creates partner section" {
+    cat > "$CONF" << 'EOF'
+[Board Alpha]
+mac=AA:AA:AA:AA:AA:AA
+type=esp32
+chip=esp32s3
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    run "$USB_DEVICE" register ppk2 --serial TEST123 --type ppk2 --partner-of "Alpha"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Registered partner 'Board Alpha:ppk2'"* ]]
+
+    # Config should have partner section with serial= (not mac=) and no chip=
+    run grep "\[Board Alpha:ppk2\]" "$CONF"
+    [ "$status" -eq 0 ]
+    run grep "serial=TEST123" "$CONF"
+    [ "$status" -eq 0 ]
+    run grep "type=ppk2" "$CONF"
+    [ "$status" -eq 0 ]
+    # Should NOT have chip= in partner section
+    run grep -A3 "\[Board Alpha:ppk2\]" "$CONF"
+    [[ "$output" != *"chip="* ]]
+}
+
+@test "register: --partner-of rejects unknown primary" {
+    cat > "$CONF" << 'EOF'
+[Board Alpha]
+mac=AA:AA:AA:AA:AA:AA
+type=esp32
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    run "$USB_DEVICE" register ppk2 --serial TEST123 --type ppk2 --partner-of "Nonexistent"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"No devices match"* ]]
+}
+
+@test "register: --partner-of rejects duplicate partner" {
+    cat > "$CONF" << 'EOF'
+[Board Alpha]
+mac=AA:AA:AA:AA:AA:AA
+type=esp32
+
+[Board Alpha:ppk2]
+serial=EXISTING
+type=ppk2
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    run "$USB_DEVICE" register ppk2 --serial NEW123 --type ppk2 --partner-of "Alpha"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"already registered"* ]]
+}
+
+# ── fuzzy partner matching ───────────────────────────────────────
+
+@test "fuzzy match: primary:role pattern resolves partner" {
+    cat > "$CONF" << 'EOF'
+[MPCB 1.9 Development]
+mac=AA:AA:AA:AA:AA:AA
+type=esp32
+chip=esp32s3
+
+[MPCB 1.9 Development:ppk2]
+serial=PPK_SERIAL
+type=ppk2
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    run "$USB_DEVICE" type "1.9:ppk2"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "ppk2" ]]
+}
+
+@test "fuzzy match: partner excluded from non-colon search" {
+    cat > "$CONF" << 'EOF'
+[MPCB 1.9 Development]
+mac=AA:AA:AA:AA:AA:AA
+type=esp32
+chip=esp32s3
+
+[MPCB 1.9 Development:ppk2]
+serial=PPK_SERIAL
+type=ppk2
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    # "1.9" should match only the primary, not the partner
+    run "$USB_DEVICE" type "1.9"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "esp32" ]]
+}
+
+@test "fuzzy match: nonexistent role fails" {
+    cat > "$CONF" << 'EOF'
+[MPCB 1.9 Development]
+mac=AA:AA:AA:AA:AA:AA
+type=esp32
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    run "$USB_DEVICE" type "1.9:ppk2"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"No devices match"* ]]
+}
+
+@test "fuzzy match: exact partner name still works" {
+    cat > "$CONF" << 'EOF'
+[Board Rev-B]
+mac=AA:AA:AA:AA:AA:AA
+type=esp32
+
+[Board Rev-B:notecard]
+serial=NC_SERIAL
+type=notecard
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial < /dev/null
+
+    run "$USB_DEVICE" type "Board Rev-B:notecard"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "notecard" ]]
+}

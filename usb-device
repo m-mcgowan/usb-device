@@ -310,15 +310,42 @@ _find_matching_indices() {
         fi
     done
 
-    # Fuzzy match: regex if special chars detected, otherwise case-insensitive substring
-    if is_regex "$pattern"; then
+    # Partner fuzzy match: split on ':', fuzzy-match primary, exact-match role
+    if [ "$include_partners" -eq 1 ]; then
+        local primary_pattern="${pattern%%:*}"
+        local role_pattern="${pattern#*:}"
+        # Find matching primary devices
+        local primary_indices=()
+        if is_regex "$primary_pattern"; then
+            for i in "${!DEVICE_NAMES[@]}"; do
+                _is_partner_device "${DEVICE_NAMES[$i]}" && continue
+                echo "${DEVICE_NAMES[$i]}" | grep -iqE "$primary_pattern" && primary_indices+=("$i")
+            done
+        else
+            for i in "${!DEVICE_NAMES[@]}"; do
+                _is_partner_device "${DEVICE_NAMES[$i]}" && continue
+                echo "${DEVICE_NAMES[$i]}" | grep -iqF "$primary_pattern" && primary_indices+=("$i")
+            done
+        fi
+        # For each matching primary, check if primary:role exists
+        local pi
+        for pi in "${primary_indices[@]}"; do
+            local composed="${DEVICE_NAMES[$pi]}:${role_pattern}"
+            for i in "${!DEVICE_NAMES[@]}"; do
+                if echo "${DEVICE_NAMES[$i]}" | grep -iqx "$composed"; then
+                    MATCH_INDICES+=("$i")
+                fi
+            done
+        done
+    # Non-partner fuzzy match: regex if special chars detected, otherwise case-insensitive substring
+    elif is_regex "$pattern"; then
         for i in "${!DEVICE_NAMES[@]}"; do
-            [ "$include_partners" -eq 0 ] && _is_partner_device "${DEVICE_NAMES[$i]}" && continue
+            _is_partner_device "${DEVICE_NAMES[$i]}" && continue
             echo "${DEVICE_NAMES[$i]}" | grep -iqE "$pattern" && MATCH_INDICES+=("$i")
         done
     else
         for i in "${!DEVICE_NAMES[@]}"; do
-            [ "$include_partners" -eq 0 ] && _is_partner_device "${DEVICE_NAMES[$i]}" && continue
+            _is_partner_device "${DEVICE_NAMES[$i]}" && continue
             echo "${DEVICE_NAMES[$i]}" | grep -iqF "$pattern" && MATCH_INDICES+=("$i")
         done
     fi
@@ -629,8 +656,8 @@ device_is_alive() {
 #
 # Provides exclusive access to devices for CI jobs and manual use.
 # Lock is a directory under LOCK_DIR (atomic mkdir).
-# Lock metadata: PID, owner, timestamp, purpose, TTL.
-# Stale locks auto-reclaimed via PID liveness and TTL expiry.
+# Lock metadata: PID, owner, timestamp, purpose, TTL, process details.
+# Stale locks auto-reclaimed via PID liveness (with start-time verification) and TTL expiry.
 
 LOCK_DIR="${USB_DEVICE_LOCK_DIR:-/tmp/usb-device-locks}"
 
@@ -641,6 +668,20 @@ _lock_key() {
 
 _lock_path() {
     echo "$LOCK_DIR/$(_lock_key "$1")"
+}
+
+# Write lock info file. Args: lock_path pid owner purpose ttl
+_write_lock_info() {
+    local lock_path="$1" pid="$2" owner="$3" purpose="$4" ttl="$5"
+    cat > "$lock_path/info" <<EOF
+PID=$pid
+OWNER=$owner
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=$purpose
+TTL=$ttl
+LSTART=$(ps -p "$pid" -o lstart= 2>/dev/null)
+COMM=$(ps -p "$pid" -o comm= 2>/dev/null)
+EOF
 }
 
 # Read a field from the lock info file
@@ -711,11 +752,24 @@ _try_reclaim_lock() {
     lock_ts=$(_lock_field "$lock_path" "TIMESTAMP")
     lock_ttl=$(_lock_field "$lock_path" "TTL")
 
-    # PID dead? (kill -0 fails with EPERM if process exists but is owned by another user,
-    # and with ESRCH if the process doesn't exist. We only reclaim on ESRCH.)
+    # PID dead or recycled? kill -0 fails with EPERM if process exists but is owned
+    # by another user, and with ESRCH if the process doesn't exist. We only reclaim
+    # on ESRCH or when the process start time doesn't match (PID recycled).
     if [ -n "$lock_pid" ]; then
         if kill -0 "$lock_pid" 2>/dev/null; then
-            : # process is alive and accessible
+            # Process is alive — verify it's the same process via start time
+            local lock_lstart current_lstart
+            lock_lstart=$(_lock_field "$lock_path" "LSTART")
+            if [ -n "$lock_lstart" ]; then
+                current_lstart=$(ps -p "$lock_pid" -o lstart= 2>/dev/null)
+                if [ -n "$current_lstart" ] && [ "$current_lstart" != "$lock_lstart" ]; then
+                    local owner
+                    owner=$(_lock_field "$lock_path" "OWNER")
+                    echo "Reclaiming stale lock (PID $lock_pid recycled, was: ${owner:-unknown})" >&2
+                    rm -rf "$lock_path"
+                    return 0
+                fi
+            fi
         elif kill -0 "$lock_pid" 2>&1 | grep -q "No such process"; then
             local owner
             owner=$(_lock_field "$lock_path" "OWNER")
@@ -754,8 +808,14 @@ _show_lock_holder() {
     purpose=$(_lock_field "$lock_path" "PURPOSE")
     ts=$(_lock_field "$lock_path" "TIMESTAMP")
     ttl=$(_lock_field "$lock_path" "TTL")
+    local comm
+    comm=$(_lock_field "$lock_path" "COMM")
     echo "  owner:   ${owner:--}" >&2
-    echo "  pid:     ${pid:--}" >&2
+    if [ -n "$comm" ]; then
+        echo "  pid:     ${pid:--} ($comm)" >&2
+    else
+        echo "  pid:     ${pid:--}" >&2
+    fi
     [ -n "$purpose" ] && echo "  purpose: $purpose" >&2
     if [ -n "$ts" ]; then
         local local_time age_str
@@ -791,13 +851,7 @@ _checkout_one() {
         _try_reclaim_lock "$lock_path"
 
         if mkdir "$lock_path" 2>/dev/null; then
-            cat > "$lock_path/info" <<EOF
-PID=$my_pid
-OWNER=$owner
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-PURPOSE=$purpose
-TTL=$ttl
-EOF
+            _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
             echo "Checked out '$RESOLVED_NAME'" >&2
             return 0
         fi
@@ -817,13 +871,7 @@ EOF
                 [ "$lock_owner" = "$owner" ] && is_reentrant=1
             fi
             if [ "$is_reentrant" -eq 1 ]; then
-                cat > "$lock_path/info" <<EOF
-PID=$my_pid
-OWNER=$owner
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-PURPOSE=$purpose
-TTL=$ttl
-EOF
+                _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
                 echo "Refreshed lock on '$RESOLVED_NAME'" >&2
                 return 0
             fi
@@ -888,13 +936,7 @@ _checkout_any() {
         _try_reclaim_lock "$lock_path" 2>/dev/null
 
         if mkdir "$lock_path" 2>/dev/null; then
-            cat > "$lock_path/info" <<EOF
-PID=$my_pid
-OWNER=$owner
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-PURPOSE=$purpose
-TTL=$ttl
-EOF
+            _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
             echo "Checked out '$RESOLVED_NAME'" >&2
             _print_checkout_result
             return 0
@@ -913,13 +955,7 @@ EOF
                 [ "$lock_owner" = "$owner" ] && is_reentrant=1
             fi
             if [ "$is_reentrant" -eq 1 ]; then
-                cat > "$lock_path/info" <<EOF
-PID=$my_pid
-OWNER=$owner
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-PURPOSE=$purpose
-TTL=$ttl
-EOF
+                _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
                 echo "Refreshed lock on '$RESOLVED_NAME'" >&2
                 _print_checkout_result
                 return 0
@@ -969,7 +1005,7 @@ _print_checkout_result() {
 }
 
 cmd_checkout() {
-    local wait=0 timeout=0 owner="" purpose="" ttl="1800" any=0
+    local wait=0 timeout=0 owner="" purpose="" ttl="0" any=0
     _lock_shared=0
     _checkout_export=0
 
@@ -1185,7 +1221,15 @@ cmd_locks() {
             [ -n "$purpose" ] && detail="$detail ($purpose)"
             [ -n "$time_str" ] && detail="$detail, since $time_str"
             [ -n "$age_str" ] && detail="$detail (${age_str} ago)"
-            [ -n "$pid" ] && detail="$detail, pid=$pid"
+            if [ -n "$pid" ]; then
+                local comm
+                comm=$(_lock_field "$lock_path" "COMM")
+                if [ -n "$comm" ]; then
+                    detail="$detail, pid=$pid ($comm)"
+                else
+                    detail="$detail, pid=$pid"
+                fi
+            fi
 
             printf "  %-30s  LOCKED  %s\n" "$name" "$detail"
         fi
@@ -1261,6 +1305,7 @@ Register options:
   --type TYPE                   Device type (default: esp32)
   --chip CHIP                   Chip variant (default: esp32s3)
   --hub-name NAME               Display name for Insight Hub (max 14 chars)
+  --partner-of DEVICE           Register as partner of DEVICE (name becomes DEVICE:role)
 
 Checkout options:
   --any                         Acquire first available match (skip locked/offline)
@@ -1270,7 +1315,7 @@ Checkout options:
   --timeout N                   Give up after N seconds (with --wait)
   --owner STR                   Who is checking out (default: user@host)
   --purpose STR                 Why (shown in locks output)
-  --ttl N                       Auto-expire lock after N seconds (default: 1800)
+  --ttl N                       Auto-expire lock after N seconds (default: 0, no expiry)
   --pid PID                     Store PID for lock ownership (default: caller's PID)
 
 Chained commands (device name first, then one or more commands):
@@ -1996,17 +2041,18 @@ cmd_hub() {
 # ── Register ──────────────────────────────────────────────────────
 
 cmd_register() {
-    local name="" mac="" type="esp32" chip="esp32s3" hub_name="" port=""
+    local name="" mac="" type="esp32" chip="esp32s3" hub_name="" port="" partner_of=""
 
     # First positional arg is the device name
     while [ $# -gt 0 ]; do
         case "$1" in
-            --port)     port="$2"; shift 2 ;;
+            --port)       port="$2"; shift 2 ;;
             --mac|--serial) mac="$2"; shift 2 ;;
-            --type)     type="$2"; shift 2 ;;
-            --chip)     chip="$2"; shift 2 ;;
-            --hub-name) hub_name="$2"; shift 2 ;;
-            -*)         die "unknown flag: $1" ;;
+            --type)       type="$2"; shift 2 ;;
+            --chip)       chip="$2"; shift 2 ;;
+            --hub-name)   hub_name="$2"; shift 2 ;;
+            --partner-of) partner_of="$2"; shift 2 ;;
+            -*)           die "unknown flag: $1" ;;
             *)
                 if [ -z "$name" ]; then
                     name="$1"; shift
@@ -2017,7 +2063,16 @@ cmd_register() {
         esac
     done
 
-    [ -n "$name" ] || die "usage: usb-device register <name> --port /dev/cu.* | --mac AA:BB:CC:DD:EE:FF [--type TYPE] [--chip CHIP] [--hub-name NAME]"
+    [ -n "$name" ] || die "usage: usb-device register <name> --port /dev/cu.* | --mac AA:BB:CC:DD:EE:FF [--type TYPE] [--chip CHIP] [--hub-name NAME] [--partner-of DEVICE]"
+
+    # Resolve partner-of to compose the full section name (e.g. "Board:ppk2")
+    if [ -n "$partner_of" ]; then
+        parse_config
+        resolve_device "$partner_of"
+        [ -n "$RESOLVED_NAME" ] || die "no device matches '$partner_of'"
+        # The positional arg is the role, compose the full name
+        name="${RESOLVED_NAME}:${name}"
+    fi
 
     # Auto-detect from port
     if [ -n "$port" ]; then
@@ -2047,7 +2102,7 @@ for p in comports():
     [ -n "$mac" ] || die "must specify --port or --mac"
 
     # Check for duplicate name
-    parse_config
+    [ -z "$partner_of" ] && parse_config
     local i
     for i in "${!DEVICE_NAMES[@]}"; do
         if [ "${DEVICE_NAMES[$i]}" = "$name" ]; then
@@ -2058,17 +2113,26 @@ for p in comports():
     # Create config dir if needed
     mkdir -p "$(dirname "$CONF")"
 
-    # Append INI section
-    {
-        echo ""
-        echo "[$name]"
-        echo "mac=$mac"
-        echo "type=$type"
-        [ -n "$chip" ] && echo "chip=$chip"
-        [ -n "$hub_name" ] && echo "hub_name=$hub_name"
-    } >> "$CONF"
-
-    echo "Registered '$name' (mac=$mac, type=$type, chip=$chip)"
+    # Append INI section — partner devices use serial= and skip chip=
+    if [ -n "$partner_of" ]; then
+        {
+            echo ""
+            echo "[$name]"
+            echo "serial=$mac"
+            echo "type=$type"
+        } >> "$CONF"
+        echo "Registered partner '$name' (serial=$mac, type=$type)"
+    else
+        {
+            echo ""
+            echo "[$name]"
+            echo "mac=$mac"
+            echo "type=$type"
+            [ -n "$chip" ] && echo "chip=$chip"
+            [ -n "$hub_name" ] && echo "hub_name=$hub_name"
+        } >> "$CONF"
+        echo "Registered '$name' (mac=$mac, type=$type, chip=$chip)"
+    fi
 
     # Reset parser cache and scan
     CONFIG_PARSED=0
