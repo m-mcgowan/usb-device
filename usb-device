@@ -1284,7 +1284,7 @@ Commands:
   help                          Show this help message
   list                          Show all registered devices and their status
   scan                          Scan USB bus and update last-known locations
-  discover                      Show connected USB devices not yet registered
+  discover [--register]          Show unregistered USB devices (--register: interactive setup)
   check                         Verify all dependencies are installed
   register <name> [options]     Register a new device
   find [-a|--available] <name>  Show hub, port, serial device info (with lock status)
@@ -1500,10 +1500,28 @@ cmd_scan() {
     echo "Scan complete: $found device(s) found, $updated location(s) updated."
 }
 
-cmd_discover() {
-    parse_config
+# Auto-detect device type from USB product string
+_guess_type() {
+    local product="$1"
+    case "$product" in
+        *PPK2*)                         echo "ppk2" ;;
+        *"JTAG/serial debug"*|*ESP*)    echo "esp32" ;;
+        *InsightHUB*)                   echo "insight_hub" ;;
+        *)                              echo "generic" ;;
+    esac
+}
 
-    # Enumerate all USB serial ports via Python
+# Collect unregistered USB devices into parallel arrays.
+# Sets: UNDISCOVERED_SERIALS, UNDISCOVERED_DEVICES, UNDISCOVERED_MFGS,
+#       UNDISCOVERED_PRODUCTS, UNDISCOVERED_LOCATIONS, UNDISCOVERED_COUNT
+_enumerate_unregistered() {
+    UNDISCOVERED_SERIALS=()
+    UNDISCOVERED_DEVICES=()
+    UNDISCOVERED_MFGS=()
+    UNDISCOVERED_PRODUCTS=()
+    UNDISCOVERED_LOCATIONS=()
+    UNDISCOVERED_COUNT=0
+
     local all_ports
     all_ports=$($PYTHON -c "
 from serial.tools.list_ports import comports
@@ -1517,10 +1535,9 @@ for p in comports():
     print(f'{sn}\t{p.device}\t{mfg}\t{prod}\t{loc}')
 " 2>/dev/null)
 
-    [ -n "$all_ports" ] || { echo "No unregistered USB devices found."; return 0; }
+    [ -n "$all_ports" ] || return 0
 
-    # Filter out registered devices and deduplicate by serial
-    local found=0 seen_serials=""
+    local seen_serials=""
     while IFS=$'\t' read -r serial device manufacturer product location; do
         [ -z "$serial" ] && continue
         local norm
@@ -1542,22 +1559,116 @@ for p in comports():
         esac
         seen_serials="$seen_serials $norm"
 
-        if [ "$found" -eq 0 ]; then
-            echo "Unregistered USB devices:"
-            echo ""
-        fi
-        found=$((found + 1))
-        printf "  %-20s  %-30s  %s %s  location=%s\n" "$serial" "$device" "${manufacturer:--}" "${product:--}" "${location:--}"
+        UNDISCOVERED_SERIALS+=("$serial")
+        UNDISCOVERED_DEVICES+=("$device")
+        UNDISCOVERED_MFGS+=("$manufacturer")
+        UNDISCOVERED_PRODUCTS+=("$product")
+        UNDISCOVERED_LOCATIONS+=("$location")
+        UNDISCOVERED_COUNT=$((UNDISCOVERED_COUNT + 1))
     done <<< "$all_ports"
+}
 
-    if [ "$found" -eq 0 ]; then
+cmd_discover() {
+    local do_register=0
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            --register) do_register=1; shift ;;
+            *)          die "unknown flag: $1" ;;
+        esac
+    done
+
+    parse_config
+    _enumerate_unregistered
+
+    if [ "$UNDISCOVERED_COUNT" -eq 0 ]; then
         echo "No unregistered USB devices found."
-    else
+        return 0
+    fi
+
+    echo "Unregistered USB devices:"
+    echo ""
+    local idx
+    for idx in $(seq 0 $((UNDISCOVERED_COUNT - 1))); do
+        local serial="${UNDISCOVERED_SERIALS[$idx]}"
+        local device="${UNDISCOVERED_DEVICES[$idx]}"
+        local mfg="${UNDISCOVERED_MFGS[$idx]}"
+        local product="${UNDISCOVERED_PRODUCTS[$idx]}"
+        local location="${UNDISCOVERED_LOCATIONS[$idx]}"
+        printf "  %d) %-20s  %-30s  %s %s  location=%s\n" "$((idx + 1))" "$serial" "$device" "${mfg:--}" "${product:--}" "${location:--}"
+    done
+
+    if [ "$do_register" -eq 0 ]; then
         echo ""
-        echo "$found unregistered device(s). Register with:"
+        echo "$UNDISCOVERED_COUNT unregistered device(s). Register with:"
         echo "  usb-device register <name> --serial <SERIAL> --type <TYPE>"
         echo "  usb-device register <role> --serial <SERIAL> --type <TYPE> --partner-of <DEVICE>"
+        return 0
     fi
+
+    # Interactive registration
+    echo ""
+    for idx in $(seq 0 $((UNDISCOVERED_COUNT - 1))); do
+        local serial="${UNDISCOVERED_SERIALS[$idx]}"
+        local product="${UNDISCOVERED_PRODUCTS[$idx]}"
+        local mfg="${UNDISCOVERED_MFGS[$idx]}"
+        local guessed_type
+        guessed_type=$(_guess_type "$product")
+
+        echo "── ${mfg} ${product} (${serial}) ──"
+        printf "  Name or role (Enter to skip): "
+        local name
+        read -r name
+        [ -z "$name" ] && { echo "  Skipped."; echo ""; continue; }
+
+        printf "  Type [%s]: " "$guessed_type"
+        local type
+        read -r type
+        type="${type:-$guessed_type}"
+
+        printf "  Partner of (device name, or Enter for standalone): "
+        local partner
+        read -r partner
+
+        if [ -n "$partner" ]; then
+            # Register as partner — name is the role
+            resolve_device "$partner"
+            if [ -z "$RESOLVED_NAME" ]; then
+                echo "  Error: no device matches '$partner'. Skipping." >&2
+                echo ""
+                continue
+            fi
+            local full_name="${RESOLVED_NAME}:${name}"
+            {
+                echo ""
+                echo "[$full_name]"
+                echo "serial=$serial"
+                echo "type=$type"
+            } >> "$CONF"
+            echo "  Registered partner '$full_name'"
+        else
+            printf "  Chip [esp32s3]: "
+            local chip
+            read -r chip
+            chip="${chip:-esp32s3}"
+            {
+                echo ""
+                echo "[$name]"
+                echo "mac=$serial"
+                echo "type=$type"
+                echo "chip=$chip"
+            } >> "$CONF"
+            echo "  Registered '$name'"
+        fi
+
+        # Refresh config for subsequent partner lookups
+        CONFIG_PARSED=0
+        parse_config
+        echo ""
+    done
+
+    echo "Running scan..."
+    CONFIG_PARSED=0
+    cmd_scan
 }
 
 cmd_list() {
@@ -2221,7 +2332,7 @@ case "${1:-}" in
     help|--help|-h) cmd_help; exit ;;
     list)           cmd_list; exit ;;
     scan)           cmd_scan; exit ;;
-    discover)       cmd_discover; exit ;;
+    discover)       shift; cmd_discover "$@"; exit ;;
     check)          cmd_check; exit ;;
     locks)          shift; cmd_locks "$@"; exit ;;
     register)       shift; cmd_register "$@"; exit ;;
