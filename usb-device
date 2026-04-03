@@ -670,18 +670,46 @@ _lock_path() {
     echo "$LOCK_DIR/$(_lock_key "$1")"
 }
 
-# Write lock info file. Args: lock_path pid owner purpose ttl
+# Write lock info file. Args: lock_path pid owner purpose ttl [refcount]
 _write_lock_info() {
     local lock_path="$1" pid="$2" owner="$3" purpose="$4" ttl="$5"
+    local refcount="${6:-1}"
     cat > "$lock_path/info" <<EOF
 PID=$pid
 OWNER=$owner
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PURPOSE=$purpose
 TTL=$ttl
+REFCOUNT=$refcount
 LSTART=$(ps -p "$pid" -o lstart= 2>/dev/null)
 COMM=$(ps -p "$pid" -o comm= 2>/dev/null)
 EOF
+}
+
+# Increment lock refcount. Returns the new count.
+_lock_incref() {
+    local lock_path="$1"
+    local count
+    count=$(_lock_field "$lock_path" "REFCOUNT")
+    count=$((${count:-1} + 1))
+    # Update REFCOUNT in place
+    if grep -q "^REFCOUNT=" "$lock_path/info" 2>/dev/null; then
+        sed -i '' "s/^REFCOUNT=.*/REFCOUNT=$count/" "$lock_path/info"
+    else
+        echo "REFCOUNT=$count" >> "$lock_path/info"
+    fi
+    echo "$count"
+}
+
+# Decrement lock refcount. Returns the new count.
+_lock_decref() {
+    local lock_path="$1"
+    local count
+    count=$(_lock_field "$lock_path" "REFCOUNT")
+    count=$((${count:-1} - 1))
+    [ "$count" -lt 0 ] && count=0
+    sed -i '' "s/^REFCOUNT=.*/REFCOUNT=$count/" "$lock_path/info"
+    echo "$count"
 }
 
 # Read a field from the lock info file
@@ -863,25 +891,17 @@ _checkout_one() {
         lock_pid=$(_lock_field "$lock_path" "PID")
         if [ -n "$lock_pid" ]; then
             local is_reentrant=0
-            local is_child=0
             if [ "$lock_pid" = "$my_pid" ]; then
                 is_reentrant=1
             elif _is_ancestor_pid "$lock_pid" "$my_pid"; then
                 local lock_owner
                 lock_owner=$(_lock_field "$lock_path" "OWNER")
                 [ "$lock_owner" = "$owner" ] && is_reentrant=1
-                is_child=1
             fi
             if [ "$is_reentrant" -eq 1 ]; then
-                if [ "$is_child" -eq 1 ]; then
-                    # Child process inheriting parent's lock — don't overwrite
-                    echo "Joined lock on '$RESOLVED_NAME' (held by pid $lock_pid)" >&2
-                    return 2  # 2 = joined, caller should not release
-                else
-                    # Same PID refreshing its own lock
-                    _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
-                    echo "Refreshed lock on '$RESOLVED_NAME'" >&2
-                fi
+                local new_count
+                new_count=$(_lock_incref "$lock_path")
+                echo "Refreshed lock on '$RESOLVED_NAME' (refcount=$new_count)" >&2
                 return 0
             fi
         fi
@@ -951,29 +971,22 @@ _checkout_any() {
             return 0
         fi
 
-        # Re-entrant: if we or an ancestor hold the lock, refresh it.
+        # Re-entrant: if we or an ancestor hold the lock, increment refcount.
         local lock_pid
         lock_pid=$(_lock_field "$lock_path" "PID")
         if [ -n "$lock_pid" ]; then
             local is_reentrant=0
-            local is_child=0
             if [ "$lock_pid" = "$my_pid" ]; then
                 is_reentrant=1
             elif _is_ancestor_pid "$lock_pid" "$my_pid"; then
                 local lock_owner
                 lock_owner=$(_lock_field "$lock_path" "OWNER")
                 [ "$lock_owner" = "$owner" ] && is_reentrant=1
-                is_child=1
             fi
             if [ "$is_reentrant" -eq 1 ]; then
-                if [ "$is_child" -eq 1 ]; then
-                    echo "Joined lock on '$RESOLVED_NAME' (held by pid $lock_pid)" >&2
-                    _print_checkout_result
-                    return 2  # 2 = joined, caller should not release
-                else
-                    _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
-                    echo "Refreshed lock on '$RESOLVED_NAME'" >&2
-                fi
+                local new_count
+                new_count=$(_lock_incref "$lock_path")
+                echo "Refreshed lock on '$RESOLVED_NAME' (refcount=$new_count)" >&2
                 _print_checkout_result
                 return 0
             fi
@@ -1114,11 +1127,20 @@ _checkin_one() {
     if [ "$force" -eq 0 ]; then
         local lock_pid
         lock_pid=$(_lock_field "$lock_path" "PID")
-        if [ -n "$lock_pid" ] && [ "$lock_pid" != "$PPID" ] && [ "$lock_pid" != "$$" ]; then
+        local my_pid="${_lock_pid:-${USB_DEVICE_LOCK_PID:-$PPID}}"
+        if [ -n "$lock_pid" ] && [ "$lock_pid" != "$my_pid" ] && [ "$lock_pid" != "$$" ]; then
             echo "Device '$RESOLVED_NAME' is not owned by this session:" >&2
             _show_lock_holder "$lock_path"
             echo "Use -f to force release" >&2
             return 1
+        fi
+
+        # Decrement refcount — only remove when it hits 0
+        local new_count
+        new_count=$(_lock_decref "$lock_path")
+        if [ "$new_count" -gt 0 ]; then
+            echo "Released hold on '$RESOLVED_NAME' (refcount=$new_count)" >&2
+            return 0
         fi
     fi
 
@@ -1250,6 +1272,9 @@ cmd_locks() {
                     detail="$detail, pid=$pid"
                 fi
             fi
+            local refcount
+            refcount=$(_lock_field "$lock_path" "REFCOUNT")
+            [ -n "$refcount" ] && [ "$refcount" -gt 1 ] 2>/dev/null && detail="$detail, refcount=$refcount"
 
             printf "  %-30s  LOCKED  %s\n" "$name" "$detail"
         fi

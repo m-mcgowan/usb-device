@@ -1083,7 +1083,7 @@ EOF
     [ ! -d "$TEST_DIR/locks/device_b" ]
 }
 
-@test "checkout: re-entrant — same PID refreshes lock" {
+@test "checkout: re-entrant — same PID increments refcount" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 
     # Create a lock owned by our PPID (simulates prior checkout from same shell)
@@ -1094,26 +1094,24 @@ OWNER=test
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PURPOSE=original
 TTL=3600
+REFCOUNT=1
 EOF
 
-    # Checkout again with same PID should succeed (re-entrant)
+    # Checkout again with same PID should succeed (re-entrant) and bump refcount
     run "$USB_DEVICE" checkout --pid "$PPID" --purpose "refreshed" "Device A"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Refreshed lock"* ]]
+    [[ "$output" == *"refcount=2"* ]]
 
-    # Lock should have updated purpose
-    run grep "^PURPOSE=refreshed" "$TEST_DIR/locks/device_a/info"
+    # Refcount should be 2
+    run grep "^REFCOUNT=2" "$TEST_DIR/locks/device_a/info"
     [ "$status" -eq 0 ]
 }
 
-@test "checkout: re-entrant — ancestor PID inherits lock" {
+@test "checkout: re-entrant — ancestor PID increments refcount" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 
     # Create a lock owned by an ancestor (grandparent PPID of the usb-device process)
-    # When bats runs usb-device, the process tree is:
-    #   bats ($$) → bash (subshell) → usb-device ($PPID = bash)
-    # Lock with bats PID ($$), which is an ancestor of usb-device's $PPID.
-    # Owner must match the caller's default (whoami@hostname) for ancestor re-entrancy.
     local default_owner="$(whoami)@$(hostname -s)"
     mkdir -p "$TEST_DIR/locks/device_a"
     cat > "$TEST_DIR/locks/device_a/info" <<EOF
@@ -1122,16 +1120,44 @@ OWNER=$default_owner
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PURPOSE=parent session
 TTL=3600
+REFCOUNT=1
 EOF
 
-    # Checkout from child process should join (not overwrite) parent's lock
+    # Checkout from child process should increment refcount
     run "$USB_DEVICE" checkout --purpose "child task" "Device A"
-    [ "$status" -eq 2 ]
-    [[ "$output" == *"Joined lock"* ]]
-
-    # Lock should still have parent's purpose (not overwritten)
-    run grep "^PURPOSE=parent session" "$TEST_DIR/locks/device_a/info"
     [ "$status" -eq 0 ]
+    [[ "$output" == *"Refreshed lock"* ]]
+    [[ "$output" == *"refcount=2"* ]]
+
+    # Refcount should be 2
+    run grep "^REFCOUNT=2" "$TEST_DIR/locks/device_a/info"
+    [ "$status" -eq 0 ]
+}
+
+@test "checkin: decrements refcount without releasing" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Use explicit --pid so both checkout calls use the same PID
+    run "$USB_DEVICE" checkout --pid $$ "Device A"
+    [ "$status" -eq 0 ]
+
+    # Re-entrant checkout to bump refcount to 2
+    run "$USB_DEVICE" checkout --pid $$ "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"refcount=2"* ]]
+
+    # First checkin should decrement, not release
+    run "$USB_DEVICE" checkin --pid $$ "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Released hold"* ]]
+    [[ "$output" == *"refcount=1"* ]]
+    [ -d "$TEST_DIR/locks/device_a" ]
+
+    # Second checkin should fully release
+    run "$USB_DEVICE" checkin --pid $$ "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Checked in"* ]]
+    [ ! -d "$TEST_DIR/locks/device_a" ]
 }
 
 @test "checkout: re-entrant — USB_DEVICE_LOCK_PID env var" {
@@ -2517,4 +2543,50 @@ EOF
     [[ "$output" == *"AA:BB:CC:DD:EE:FF"* ]]
     [[ "$output" != *"Bluetooth"* ]]
     [[ "$output" == *"1 unregistered device(s)"* ]]
+}
+
+# ── locks refcount display ───────────────────────────────────────
+
+@test "locks: shows refcount when greater than 1" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    local real_lstart
+    real_lstart=$(ps -p "$PPID" -o lstart= 2>/dev/null)
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=test-user
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=testing
+TTL=0
+REFCOUNT=3
+LSTART=$real_lstart
+COMM=bash
+EOF
+
+    run "$USB_DEVICE" locks
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"refcount=3"* ]]
+}
+
+@test "locks: hides refcount when 1" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    local real_lstart
+    real_lstart=$(ps -p "$PPID" -o lstart= 2>/dev/null)
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=test-user
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=testing
+TTL=0
+REFCOUNT=1
+LSTART=$real_lstart
+COMM=bash
+EOF
+
+    run "$USB_DEVICE" locks
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"refcount"* ]]
 }
