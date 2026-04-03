@@ -890,19 +890,23 @@ _checkout_one() {
         local lock_pid
         lock_pid=$(_lock_field "$lock_path" "PID")
         if [ -n "$lock_pid" ]; then
-            local is_reentrant=0
             if [ "$lock_pid" = "$my_pid" ]; then
-                is_reentrant=1
+                # Same PID — refresh lock metadata, don't change refcount
+                local refcount
+                refcount=$(_lock_field "$lock_path" "REFCOUNT")
+                _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl" "${refcount:-1}"
+                echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+                return 0
             elif _is_ancestor_pid "$lock_pid" "$my_pid"; then
+                # Child/ancestor — increment refcount (new holder)
                 local lock_owner
                 lock_owner=$(_lock_field "$lock_path" "OWNER")
-                [ "$lock_owner" = "$owner" ] && is_reentrant=1
-            fi
-            if [ "$is_reentrant" -eq 1 ]; then
-                local new_count
-                new_count=$(_lock_incref "$lock_path")
-                echo "Refreshed lock on '$RESOLVED_NAME' (refcount=$new_count)" >&2
-                return 0
+                if [ "$lock_owner" = "$owner" ]; then
+                    local new_count
+                    new_count=$(_lock_incref "$lock_path")
+                    echo "Acquired lock on '$RESOLVED_NAME' (refcount=$new_count)" >&2
+                    return 0
+                fi
             fi
         fi
 
@@ -971,24 +975,27 @@ _checkout_any() {
             return 0
         fi
 
-        # Re-entrant: if we or an ancestor hold the lock, increment refcount.
+        # Re-entrant: same PID refreshes, ancestor/child increments refcount.
         local lock_pid
         lock_pid=$(_lock_field "$lock_path" "PID")
         if [ -n "$lock_pid" ]; then
-            local is_reentrant=0
             if [ "$lock_pid" = "$my_pid" ]; then
-                is_reentrant=1
+                local refcount
+                refcount=$(_lock_field "$lock_path" "REFCOUNT")
+                _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl" "${refcount:-1}"
+                echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+                _print_checkout_result
+                return 0
             elif _is_ancestor_pid "$lock_pid" "$my_pid"; then
                 local lock_owner
                 lock_owner=$(_lock_field "$lock_path" "OWNER")
-                [ "$lock_owner" = "$owner" ] && is_reentrant=1
-            fi
-            if [ "$is_reentrant" -eq 1 ]; then
-                local new_count
-                new_count=$(_lock_incref "$lock_path")
-                echo "Refreshed lock on '$RESOLVED_NAME' (refcount=$new_count)" >&2
-                _print_checkout_result
-                return 0
+                if [ "$lock_owner" = "$owner" ]; then
+                    local new_count
+                    new_count=$(_lock_incref "$lock_path")
+                    echo "Acquired lock on '$RESOLVED_NAME' (refcount=$new_count)" >&2
+                    _print_checkout_result
+                    return 0
+                fi
             fi
         fi
 

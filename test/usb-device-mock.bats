@@ -1083,7 +1083,7 @@ EOF
     [ ! -d "$TEST_DIR/locks/device_b" ]
 }
 
-@test "checkout: re-entrant — same PID increments refcount" {
+@test "checkout: re-entrant — same PID refreshes without incrementing refcount" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 
     # Create a lock owned by our PPID (simulates prior checkout from same shell)
@@ -1097,14 +1097,16 @@ TTL=3600
 REFCOUNT=1
 EOF
 
-    # Checkout again with same PID should succeed (re-entrant) and bump refcount
+    # Checkout again with same PID should refresh without changing refcount
     run "$USB_DEVICE" checkout --pid "$PPID" --purpose "refreshed" "Device A"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Refreshed lock"* ]]
-    [[ "$output" == *"refcount=2"* ]]
 
-    # Refcount should be 2
-    run grep "^REFCOUNT=2" "$TEST_DIR/locks/device_a/info"
+    # Refcount should still be 1
+    run grep "^REFCOUNT=1" "$TEST_DIR/locks/device_a/info"
+    [ "$status" -eq 0 ]
+    # Purpose should be updated
+    run grep "^PURPOSE=refreshed" "$TEST_DIR/locks/device_a/info"
     [ "$status" -eq 0 ]
 }
 
@@ -1126,7 +1128,7 @@ EOF
     # Checkout from child process should increment refcount
     run "$USB_DEVICE" checkout --purpose "child task" "Device A"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Refreshed lock"* ]]
+    [[ "$output" == *"Acquired lock"* ]]
     [[ "$output" == *"refcount=2"* ]]
 
     # Refcount should be 2
@@ -1137,14 +1139,20 @@ EOF
 @test "checkin: decrements refcount without releasing" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 
-    # Use explicit --pid so both checkout calls use the same PID
-    run "$USB_DEVICE" checkout --pid $$ "Device A"
-    [ "$status" -eq 0 ]
-
-    # Re-entrant checkout to bump refcount to 2
-    run "$USB_DEVICE" checkout --pid $$ "Device A"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"refcount=2"* ]]
+    # Create a lock with refcount=2 (simulates parent + child holder)
+    local real_lstart
+    real_lstart=$(ps -p $$ -o lstart= 2>/dev/null)
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$$
+OWNER=test
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=shared
+TTL=3600
+REFCOUNT=2
+LSTART=$real_lstart
+COMM=bash
+EOF
 
     # First checkin should decrement, not release
     run "$USB_DEVICE" checkin --pid $$ "Device A"
