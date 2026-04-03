@@ -1124,13 +1124,13 @@ PURPOSE=parent session
 TTL=3600
 EOF
 
-    # Checkout from child process should succeed (ancestor re-entrant)
+    # Checkout from child process should join (not overwrite) parent's lock
     run "$USB_DEVICE" checkout --purpose "child task" "Device A"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"Refreshed lock"* ]]
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"Joined lock"* ]]
 
-    # Lock should have updated purpose
-    run grep "^PURPOSE=child task" "$TEST_DIR/locks/device_a/info"
+    # Lock should still have parent's purpose (not overwritten)
+    run grep "^PURPOSE=parent session" "$TEST_DIR/locks/device_a/info"
     [ "$status" -eq 0 ]
 }
 

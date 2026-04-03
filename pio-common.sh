@@ -95,7 +95,8 @@ pio_exec() {
 }
 
 # Acquire device lock if not already held. Sets PIO_LOCK_ACQUIRED=1 if we took it.
-# Re-entrant: if an ancestor process holds the lock, checkout refreshes it.
+# Re-entrant: if an ancestor process holds the lock, we join without taking ownership.
+# Exit codes from checkout: 0=acquired/refreshed, 2=joined (parent holds lock).
 # Unsets PIO_LABGRID_DEVICE to prevent pio-labgrid from attempting its own lock —
 # these scripts handle port resolution and locking themselves.
 pio_lock() {
@@ -106,8 +107,12 @@ pio_lock() {
     usb-device checkout --pid $$ --purpose "$purpose" --ttl 3600 "$dev" 2>/dev/null
     local rc=$?
     if [ "$rc" -eq 0 ]; then
+        # We own the lock — release it on exit
         PIO_LOCK_ACQUIRED=1
         export USB_DEVICE_LOCK_PID=$$
+    elif [ "$rc" -eq 2 ]; then
+        # Joined parent's lock — don't release on exit
+        PIO_LOCK_ACQUIRED=0
     else
         echo "error: could not acquire lock on '$dev'" >&2
         return 1

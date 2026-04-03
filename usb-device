@@ -863,16 +863,25 @@ _checkout_one() {
         lock_pid=$(_lock_field "$lock_path" "PID")
         if [ -n "$lock_pid" ]; then
             local is_reentrant=0
+            local is_child=0
             if [ "$lock_pid" = "$my_pid" ]; then
                 is_reentrant=1
             elif _is_ancestor_pid "$lock_pid" "$my_pid"; then
                 local lock_owner
                 lock_owner=$(_lock_field "$lock_path" "OWNER")
                 [ "$lock_owner" = "$owner" ] && is_reentrant=1
+                is_child=1
             fi
             if [ "$is_reentrant" -eq 1 ]; then
-                _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
-                echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+                if [ "$is_child" -eq 1 ]; then
+                    # Child process inheriting parent's lock — don't overwrite
+                    echo "Joined lock on '$RESOLVED_NAME' (held by pid $lock_pid)" >&2
+                    return 2  # 2 = joined, caller should not release
+                else
+                    # Same PID refreshing its own lock
+                    _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
+                    echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+                fi
                 return 0
             fi
         fi
@@ -947,16 +956,24 @@ _checkout_any() {
         lock_pid=$(_lock_field "$lock_path" "PID")
         if [ -n "$lock_pid" ]; then
             local is_reentrant=0
+            local is_child=0
             if [ "$lock_pid" = "$my_pid" ]; then
                 is_reentrant=1
             elif _is_ancestor_pid "$lock_pid" "$my_pid"; then
                 local lock_owner
                 lock_owner=$(_lock_field "$lock_path" "OWNER")
                 [ "$lock_owner" = "$owner" ] && is_reentrant=1
+                is_child=1
             fi
             if [ "$is_reentrant" -eq 1 ]; then
-                _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
-                echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+                if [ "$is_child" -eq 1 ]; then
+                    echo "Joined lock on '$RESOLVED_NAME' (held by pid $lock_pid)" >&2
+                    _print_checkout_result
+                    return 2  # 2 = joined, caller should not release
+                else
+                    _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
+                    echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+                fi
                 _print_checkout_result
                 return 0
             fi
