@@ -28,5 +28,6 @@ if [ "$rc" -eq 1 ]; then show_usage >&2; exit 1; fi
 port=$(usb-device port "$PIO_DEV") || exit 1
 pio_lock "$PIO_DEV" "monitor" || exit 1
 trap pio_cleanup EXIT
+pio_ensure_local_deps
 pio_log_setup monitor
 pio_exec pio device monitor --port "$port" --baud 115200 --eol LF ${PIO_ARGS[@]+"${PIO_ARGS[@]}"}

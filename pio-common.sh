@@ -124,6 +124,24 @@ pio_unlock() {
     fi
 }
 
+# Ensure local library symlinks exist before PIO's library manager runs.
+# Without this, commands like `pio device monitor` trigger lib resolution
+# which fails with FileExistsError when a git URL has a local symlink override.
+pio_ensure_local_deps() {
+    local script
+    # Look for the script relative to the project's shared dir
+    for candidate in \
+        "shared/scripts/pio_local_deps.py" \
+        "../shared/scripts/pio_local_deps.py" \
+        "../../shared/scripts/pio_local_deps.py"; do
+        if [ -f "$candidate" ]; then
+            script="$candidate"
+            break
+        fi
+    done
+    [ -n "${script:-}" ] && python3 "$script" . 2>/dev/null || true
+}
+
 # Trap handler for clean exit.
 pio_cleanup() {
     pio_unlock
