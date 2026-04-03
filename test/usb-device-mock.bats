@@ -161,7 +161,18 @@ find_mock_device() {
     return 1
 }
 
-if [[ "$SCRIPT" == *"p.device == port"* && "$SCRIPT" == *"serial_number"* ]]; then
+if [[ "$SCRIPT" == *"p.manufacturer"* && "$SCRIPT" == *"for p in comports()"* ]]; then
+    # cmd_discover: enumerate all ports as serial\tdevice\tmanufacturer\tproduct\tlocation
+    if [ -f "$MOCK_FILE" ]; then
+        while IFS='|' read -r sn dev loc product; do
+            [ -z "$sn" ] || [ "$sn" = "-" ] && continue
+            mfg="-"
+            [[ "$product" == *"Espressif"* ]] && mfg="Espressif"
+            [[ "$product" == *"PPK2"* ]] && mfg="Nordic Semiconductor"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$sn" "$dev" "$mfg" "${product:--}" "${loc:--}"
+        done < "$MOCK_FILE"
+    fi
+elif [[ "$SCRIPT" == *"p.device == port"* && "$SCRIPT" == *"serial_number"* ]]; then
     # cmd_register auto-detect: match by port path, print serial_number\tdescription
     # The script sets: port = '/dev/cu.xxx'
     PORT_PATH=$(echo "$SCRIPT" | grep -oE "port = '[^']+'" | sed "s/port = '//;s/'//")
@@ -2451,4 +2462,59 @@ EOF
     run "$USB_DEVICE" locks --prune
     [ "$status" -eq 0 ]
     [[ "$output" == *"Pruned 1 stale lock(s)"* ]]
+}
+
+# ── discover ─────────────────────────────────────────────────────
+
+@test "discover: shows unregistered devices" {
+    cat > "$CONF" << 'EOF'
+[Board Alpha]
+mac=AA:AA:AA:AA:AA:AA
+type=esp32
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-2.1|Espressif USB JTAG/serial debug unit
+BB:BB:BB:BB:BB:BB|/dev/cu.usbmodem201|20-2.2|PPK2
+EOF
+
+    run "$USB_DEVICE" discover
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Unregistered USB devices:"* ]]
+    [[ "$output" == *"BB:BB:BB:BB:BB:BB"* ]]
+    # Registered device should NOT appear
+    [[ "$output" != *"AA:AA:AA:AA:AA:AA"* ]]
+    [[ "$output" == *"1 unregistered device(s)"* ]]
+}
+
+@test "discover: reports none when all devices registered" {
+    cat > "$CONF" << 'EOF'
+[Board Alpha]
+mac=AA:AA:AA:AA:AA:AA
+type=esp32
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial << 'EOF'
+AA:AA:AA:AA:AA:AA|/dev/cu.usbmodem101|20-2.1|Espressif USB JTAG/serial debug unit
+EOF
+
+    run "$USB_DEVICE" discover
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"No unregistered USB devices found"* ]]
+}
+
+@test "discover: skips devices with no serial number" {
+    cat > "$CONF" << 'EOF'
+EOF
+    mock_uhubctl < /dev/null
+    mock_pyserial << 'EOF'
+-|/dev/cu.Bluetooth||-
+AA:BB:CC:DD:EE:FF|/dev/cu.usbmodem101|20-2.1|Espressif device
+EOF
+
+    run "$USB_DEVICE" discover
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"AA:BB:CC:DD:EE:FF"* ]]
+    [[ "$output" != *"Bluetooth"* ]]
+    [[ "$output" == *"1 unregistered device(s)"* ]]
 }

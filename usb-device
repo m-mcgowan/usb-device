@@ -1284,6 +1284,7 @@ Commands:
   help                          Show this help message
   list                          Show all registered devices and their status
   scan                          Scan USB bus and update last-known locations
+  discover                      Show connected USB devices not yet registered
   check                         Verify all dependencies are installed
   register <name> [options]     Register a new device
   find [-a|--available] <name>  Show hub, port, serial device info (with lock status)
@@ -1497,6 +1498,66 @@ cmd_scan() {
 
     echo ""
     echo "Scan complete: $found device(s) found, $updated location(s) updated."
+}
+
+cmd_discover() {
+    parse_config
+
+    # Enumerate all USB serial ports via Python
+    local all_ports
+    all_ports=$($PYTHON -c "
+from serial.tools.list_ports import comports
+for p in comports():
+    sn = p.serial_number or ''
+    if not sn:
+        continue
+    mfg = p.manufacturer or '-'
+    prod = p.product or '-'
+    loc = p.location or '-'
+    print(f'{sn}\t{p.device}\t{mfg}\t{prod}\t{loc}')
+" 2>/dev/null)
+
+    [ -n "$all_ports" ] || { echo "No unregistered USB devices found."; return 0; }
+
+    # Filter out registered devices and deduplicate by serial
+    local found=0 seen_serials=""
+    while IFS=$'\t' read -r serial device manufacturer product location; do
+        [ -z "$serial" ] && continue
+        local norm
+        norm=$(normalize_mac "$serial")
+
+        # Skip registered devices
+        local registered=0 i
+        for i in "${!DEVICE_MACS[@]}"; do
+            if [ "$(normalize_mac "${DEVICE_MACS[$i]}")" = "$norm" ]; then
+                registered=1
+                break
+            fi
+        done
+        [ "$registered" -eq 1 ] && continue
+
+        # Deduplicate by serial
+        case "$seen_serials" in
+            *"$norm"*) continue ;;
+        esac
+        seen_serials="$seen_serials $norm"
+
+        if [ "$found" -eq 0 ]; then
+            echo "Unregistered USB devices:"
+            echo ""
+        fi
+        found=$((found + 1))
+        printf "  %-20s  %-30s  %s %s  location=%s\n" "$serial" "$device" "${manufacturer:--}" "${product:--}" "${location:--}"
+    done <<< "$all_ports"
+
+    if [ "$found" -eq 0 ]; then
+        echo "No unregistered USB devices found."
+    else
+        echo ""
+        echo "$found unregistered device(s). Register with:"
+        echo "  usb-device register <name> --serial <SERIAL> --type <TYPE>"
+        echo "  usb-device register <role> --serial <SERIAL> --type <TYPE> --partner-of <DEVICE>"
+    fi
 }
 
 cmd_list() {
@@ -2160,6 +2221,7 @@ case "${1:-}" in
     help|--help|-h) cmd_help; exit ;;
     list)           cmd_list; exit ;;
     scan)           cmd_scan; exit ;;
+    discover)       cmd_discover; exit ;;
     check)          cmd_check; exit ;;
     locks)          shift; cmd_locks "$@"; exit ;;
     register)       shift; cmd_register "$@"; exit ;;
