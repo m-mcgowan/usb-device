@@ -59,17 +59,31 @@ _pio_resolve_device() {
     return 1
 }
 
+# Resolve a fuzzy device name to the exact registered name.
+# Prompts for selection if ambiguous (interactive TTY only).
+_pio_resolve_name() {
+    local pattern="$1"
+    local resolved
+    resolved=$(usb-device find "$pattern" | grep "^name:" | head -1 | sed 's/^name: *//')
+    if [ -z "$resolved" ]; then
+        return 1
+    fi
+    echo "$resolved"
+}
+
 # Parse arguments: last arg is device name, rest are pass-through.
 # When no device arg given, resolves via:
 #   1. DEVICE_NAME env var (explicit default from piodev/piodevlock)
 #   2. Single locked device in this session (auto-select)
 #   3. Multiple locked devices + interactive TTY (prompt)
 #   4. Otherwise error
-# Sets: PIO_DEV, PIO_ARGS
+# Sets: PIO_DEV (always an exact registered name), PIO_ARGS
 pio_parse_args() {
     if [ $# -ge 1 ]; then
-        PIO_DEV="${@:$#}"
+        local raw_dev="${@:$#}"
         PIO_ARGS=("${@:1:$#-1}")
+        # Resolve fuzzy name once so subsequent usb-device calls don't re-prompt
+        PIO_DEV=$(_pio_resolve_name "$raw_dev") || return 1
         return 0
     fi
 
