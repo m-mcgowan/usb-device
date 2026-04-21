@@ -5,3 +5,5 @@ __pycache__/
 labgrid/deploy/exporter.yaml
 labgrid/deploy/fixtures.yaml
 .claude/
+logs/
+coverage/

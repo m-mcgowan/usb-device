@@ -885,14 +885,19 @@ EOF
 @test "checkin: refuses to release another process's lock" {
     export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
 
-    # Lock held by PPID (bats parent, always alive and accessible)
+    # Use a non-ancestor process as the lock holder (sleep in background)
+    sleep 300 &
+    local other_pid=$!
+
     mkdir -p "$TEST_DIR/locks/device_a"
     cat > "$TEST_DIR/locks/device_a/info" <<EOF
-PID=$PPID
+PID=$other_pid
 OWNER=other-user
-TIMESTAMP=2026-02-19T10:00:00Z
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 PURPOSE=testing
-TTL=999999
+TTL=0
+LSTART=$(ps -p "$other_pid" -o lstart= 2>/dev/null)
+COMM=sleep
 EOF
 
     run "$USB_DEVICE" checkin "Device A"
@@ -900,6 +905,8 @@ EOF
     [[ "$output" == *"not owned by this session"* ]]
     # Lock should still exist
     [ -d "$TEST_DIR/locks/device_a" ]
+
+    kill "$other_pid" 2>/dev/null || true
 }
 
 @test "checkin: force releases another process's lock" {
@@ -1166,6 +1173,32 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"Checked in"* ]]
     [ ! -d "$TEST_DIR/locks/device_a" ]
+}
+
+@test "checkin: descendant of lock holder can release" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Create a lock owned by $PPID (ancestor of current $$)
+    local real_lstart
+    real_lstart=$(ps -p "$PPID" -o lstart= 2>/dev/null)
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=test
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=parent-session
+TTL=0
+REFCOUNT=2
+LSTART=$real_lstart
+COMM=bash
+EOF
+
+    # Checkin from child ($$) should succeed — $$ is a descendant of $PPID
+    run "$USB_DEVICE" checkin --pid $$ "Device A"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Released hold"* ]]
+    [[ "$output" == *"refcount=1"* ]]
+    [ -d "$TEST_DIR/locks/device_a" ]
 }
 
 @test "checkout: re-entrant — USB_DEVICE_LOCK_PID env var" {
@@ -2179,6 +2212,87 @@ EOF
 
     # Should not show spurious "checked out" message for empty device name
     [[ "$output" != *"Device '' is checked out"* ]]
+}
+
+# ── Selection menu: lock status annotations ──────────────────────
+
+@test "find: selection menu shows lock status for locked devices" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # Mock device B as connected so find succeeds after selection
+    mock_pyserial << 'EOF'
+BB:BB:BB:BB:BB:BB|/dev/cu.usbmodem101|20-2.1
+EOF
+    jq '.["Device B"] = {"hub":"20-2","port":"1","serial_port":"/dev/cu.usbmodem101"}' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+
+    # Lock Device A with a real LSTART so it won't be reclaimed
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=ci-user
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=integration-test
+TTL=0
+LSTART=$(ps -p "$PPID" -o lstart= 2>/dev/null)
+COMM=$(ps -p "$PPID" -o comm= 2>/dev/null)
+EOF
+
+    # "Device" matches A, B, C — pipe "2" to select Device B
+    # The menu should annotate Device A as locked
+    run bash -c 'echo 2 | "$1" find "$2"' _ "$USB_DEVICE" "Device"
+    [ "$status" -eq 0 ]
+
+    # Device A should show as LOCKED with owner info
+    [[ "$output" == *"Device A"*"LOCKED"*"ci-user"* ]]
+    # Device B should NOT show as locked
+    [[ "$output" != *"Device B"*"LOCKED"* ]]
+}
+
+@test "find: selection menu shows offline status" {
+    # Only Device B is connected — A and C are offline
+    mock_pyserial << 'EOF'
+BB:BB:BB:BB:BB:BB|/dev/cu.usbmodem101|20-2.1
+EOF
+    jq '.["Device B"] = {"hub":"20-2","port":"1","serial_port":"/dev/cu.usbmodem101"}' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+
+    # "Device" matches A, B, C — pipe "1" to select an option
+    run bash -c 'echo 1 | "$1" find "$2"' _ "$USB_DEVICE" "Device"
+
+    # Device A should show as offline
+    echo "$output" | grep "Device A" | grep -q "offline"
+    # Device B should NOT show as offline (check the specific menu line)
+    ! echo "$output" | grep "Device B" | grep -q "offline"
+    # Device C should show as offline
+    echo "$output" | grep "Device C" | grep -q "offline"
+}
+
+@test "find: selection menu shows both offline and locked" {
+    export USB_DEVICE_LOCK_DIR="$TEST_DIR/locks"
+
+    # No devices connected (all offline)
+    mock_pyserial < /dev/null
+
+    # Lock Device A
+    mkdir -p "$TEST_DIR/locks/device_a"
+    cat > "$TEST_DIR/locks/device_a/info" <<EOF
+PID=$PPID
+OWNER=ci-user
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PURPOSE=testing
+TTL=0
+LSTART=$(ps -p "$PPID" -o lstart= 2>/dev/null)
+COMM=$(ps -p "$PPID" -o comm= 2>/dev/null)
+EOF
+
+    # "Device" matches A, B, C — pipe "1" to select
+    run bash -c 'echo 1 | "$1" find "$2"' _ "$USB_DEVICE" "Device"
+
+    # Device A should show both offline and locked
+    echo "$output" | grep "Device A" | grep -q "offline"
+    echo "$output" | grep "Device A" | grep -q "LOCKED"
+    # Device B should show offline but not locked
+    echo "$output" | grep "Device B" | grep -q "offline"
+    ! echo "$output" | grep "Device B" | grep -q "LOCKED"
 }
 
 # ── Lock metadata: LSTART, COMM, PID recycling ──────────────────

@@ -118,7 +118,7 @@ pio_lock() {
     unset PIO_LABGRID_DEVICE
     local dev="$1"
     local purpose="${2:-pio}"
-    usb-device checkout --pid $$ --purpose "$purpose" --ttl 3600 "$dev" 2>/dev/null
+    usb-device checkout --pid $$ --purpose "$purpose" "$dev" 2>/dev/null
     local rc=$?
     if [ "$rc" -eq 0 ]; then
         PIO_LOCK_ACQUIRED=1

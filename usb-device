@@ -418,9 +418,23 @@ resolve_device() {
 
     # Multiple matches — interactive selection
     echo "Multiple devices match '$pattern':" >&2
+    mkdir -p "$LOCK_DIR"
     local i
     for i in "${!MATCH_INDICES[@]}"; do
-        echo "  $((i+1))) ${DEVICE_NAMES[${MATCH_INDICES[$i]}]}" >&2
+        local idx="${MATCH_INDICES[$i]}"
+        local label="${DEVICE_NAMES[$idx]}"
+        local annotations=""
+        local mac="${DEVICE_MACS[$idx]}"
+        if [ -n "$mac" ] && ! _is_connected "$mac"; then
+            annotations="offline"
+        fi
+        if _is_locked "$label"; then
+            local lock_detail="${LOCK_OWNER:-?}"
+            [ -n "${LOCK_PURPOSE:-}" ] && lock_detail="$lock_detail ($LOCK_PURPOSE)"
+            annotations="${annotations:+$annotations, }LOCKED by $lock_detail"
+        fi
+        [ -n "$annotations" ] && label="$label  [$annotations]"
+        echo "  $((i+1))) $label" >&2
     done
     printf "Select [1-%d]: " "${#MATCH_INDICES[@]}" >&2
     local choice
@@ -902,9 +916,10 @@ _checkout_one() {
                 local lock_owner
                 lock_owner=$(_lock_field "$lock_path" "OWNER")
                 if [ "$lock_owner" = "$owner" ]; then
-                    local new_count
+                    local new_count lock_comm
                     new_count=$(_lock_incref "$lock_path")
-                    echo "Acquired lock on '$RESOLVED_NAME' (refcount=$new_count)" >&2
+                    lock_comm=$(_lock_field "$lock_path" "COMM")
+                    echo "Acquired lock on '$RESOLVED_NAME' from ${lock_comm:-pid} $lock_pid (refcount=$new_count)" >&2
                     return 0
                 fi
             fi
@@ -990,9 +1005,10 @@ _checkout_any() {
                 local lock_owner
                 lock_owner=$(_lock_field "$lock_path" "OWNER")
                 if [ "$lock_owner" = "$owner" ]; then
-                    local new_count
+                    local new_count lock_comm
                     new_count=$(_lock_incref "$lock_path")
-                    echo "Acquired lock on '$RESOLVED_NAME' (refcount=$new_count)" >&2
+                    lock_comm=$(_lock_field "$lock_path" "COMM")
+                    echo "Acquired lock on '$RESOLVED_NAME' from ${lock_comm:-pid} $lock_pid (refcount=$new_count)" >&2
                     _print_checkout_result
                     return 0
                 fi
@@ -1136,10 +1152,13 @@ _checkin_one() {
         lock_pid=$(_lock_field "$lock_path" "PID")
         local my_pid="${_lock_pid:-${USB_DEVICE_LOCK_PID:-$PPID}}"
         if [ -n "$lock_pid" ] && [ "$lock_pid" != "$my_pid" ] && [ "$lock_pid" != "$$" ]; then
-            echo "Device '$RESOLVED_NAME' is not owned by this session:" >&2
-            _show_lock_holder "$lock_path"
-            echo "Use -f to force release" >&2
-            return 1
+            # Also allow descendants of the lock holder to release
+            if ! _is_ancestor_pid "$lock_pid" "$my_pid" && ! _is_ancestor_pid "$lock_pid" "$$"; then
+                echo "Device '$RESOLVED_NAME' is not owned by this session:" >&2
+                _show_lock_holder "$lock_path"
+                echo "Use -f to force release" >&2
+                return 1
+            fi
         fi
 
         # Decrement refcount — only remove when it hits 0
@@ -1339,6 +1358,7 @@ Commands:
   find [-a|--available] <name>  Show hub, port, serial device info (with lock status)
                                   -a: first connected+unlocked match (no prompt)
   field <name> <key>            Print a custom config field value (for scripting)
+  partner <name> [role]         Find partner device(s) — JSON output (for scripting)
   type <name>                   Print device type (for scripting)
   reset [-f|--force] <name>     Power-cycle a device (escalates to hub if needed)
   off <name>                    Turn off power to a device
@@ -2217,18 +2237,37 @@ cmd_field() {
     local name="$1" key="$2"
     [ -n "$name" ] || die "usage: usb-device field <name> <key>"
     [ -n "$key"  ] || die "usage: usb-device field <name> <key>"
-    local val
-    val=$(awk -v section="[$name]" -v k="$key" '
-        $0 == section   { in_s=1; next }
-        /^\[/           { in_s=0 }
-        in_s && $0 ~ "^"k"[ \t]*=" {
-            sub(/^[^=]*=[ \t]*/, "")
-            print
-            exit
+    USB_DEVICE_CONF="$CONF" "$PYTHON" -m usb_device field "$name" "$key"
+}
+
+cmd_partner() {
+    [ -n "${1:-}" ] || die "usage: usb-device partner <name> <role> | usb-device partner --all <name>"
+    if [ "${1:-}" = "--all" ]; then
+        shift
+        [ -n "${1:-}" ] || die "usage: usb-device partner --all <name>"
+        local results
+        results=$(USB_DEVICE_CONF="$CONF" "$PYTHON" -m usb_device partners "$1") || {
+            echo "No partners found for '$1'" >&2
+            return 1
         }
-    ' "$CONF")
-    [ -n "$val" ] || return 1
-    echo "$val"
+        echo "$results"
+        return 0
+    fi
+    local name="$1" role="${2:-}"
+    if [ -z "$role" ]; then
+        # No role — list all partners
+        local results
+        results=$(USB_DEVICE_CONF="$CONF" "$PYTHON" -m usb_device partners "$name") || {
+            echo "No partners found for '$name'" >&2
+            return 1
+        }
+        echo "$results"
+        return 0
+    fi
+    USB_DEVICE_CONF="$CONF" "$PYTHON" -m usb_device partner "$name" "$role" || {
+        echo "No '$role' partner found for '$name'" >&2
+        return 1
+    }
 }
 
 cmd_bootloader() {
@@ -2384,6 +2423,7 @@ case "${1:-}" in
     discover)       shift; cmd_discover "$@"; exit ;;
     check)          cmd_check; exit ;;
     locks)          shift; cmd_locks "$@"; exit ;;
+    partner)        shift; cmd_partner "$@"; exit ;;
     register)       shift; cmd_register "$@"; exit ;;
     hub)            shift; cmd_hub "$@"; exit ;;
 esac
