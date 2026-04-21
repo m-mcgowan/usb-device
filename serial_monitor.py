@@ -119,11 +119,13 @@ def power_reset(name_or_port: str, force: bool = False):
 
 class SerialMonitor:
     def __init__(self, port: str, baud: int = 115200, timestamps: bool = False,
-                 timeout: float = 0, exit_patterns: list = None):
+                 timeout: float = 0, exit_patterns: list = None,
+                 reconnect_timeout: float = 0):
         self.port = port
         self.baud = baud
         self.timestamps = timestamps
         self.timeout = timeout
+        self.reconnect_timeout = reconnect_timeout
         self.running = False
         self._ser = None
         self._old_term = None
@@ -137,16 +139,41 @@ class SerialMonitor:
     def _open(self):
         import serial
         retries = 0
-        while retries < 20:
+        rt = self.reconnect_timeout if self.reconnect_timeout else (10 if self.timeout else 0)
+        max_retries = int(rt / 0.5) if rt else 0  # 0 = unlimited
+        # Acquire an exclusive advisory lock on the serial port so a second
+        # monitor instance can't fight over it. Unix serial TTYs allow
+        # multiple readers by default, which silently splits the byte stream.
+        import fcntl
+        while max_retries == 0 or retries < max_retries:
             try:
-                self._ser = serial.Serial(self.port, self.baud, timeout=0.1)
+                # Belt-and-suspenders exclusive access:
+                # 1. pyserial `exclusive=True` → calls TIOCEXCL on the fd.
+                #    Honored by other TIOCEXCL-aware openers (reliable on
+                #    Linux, inconsistent on macOS).
+                # 2. flock(LOCK_EX | LOCK_NB) → portable advisory lock
+                #    honored by any flock-aware process on both platforms.
+                ser = serial.Serial(self.port, self.baud, timeout=0.1, exclusive=True)
+                try:
+                    fcntl.flock(ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (OSError, BlockingIOError):
+                    # Another process holds the lock. Close and retry (it may
+                    # exit soon) rather than silently sharing the port.
+                    ser.close()
+                    if retries == 0:
+                        print(f"[monitor] {self.port} is in use by another process, waiting...",
+                              file=sys.stderr)
+                    raise serial.SerialException("port locked by another process")
+                self._ser = ser
+                if retries > 0:
+                    print(f"[monitor] Reconnected after {retries * 0.5:.0f}s", file=sys.stderr)
                 return
             except serial.SerialException:
                 retries += 1
                 if retries == 1:
                     print(f"[monitor] Waiting for {self.port}...", file=sys.stderr)
                 time.sleep(0.5)
-        print(f"[monitor] error: could not open {self.port} after 10s", file=sys.stderr)
+        print(f"[monitor] error: could not open {self.port} after {retries * 0.5:.0f}s", file=sys.stderr)
         sys.exit(1)
 
     def _close(self):
@@ -349,6 +376,8 @@ def main():
                         help="Show timestamps on each line")
     parser.add_argument("--timeout", type=float, default=0, metavar="SECS",
                         help="Exit after SECS seconds (0 = run until killed)")
+    parser.add_argument("--reconnect-timeout", type=float, default=0, metavar="SECS",
+                        help="Give up reconnecting after SECS seconds (0 = wait forever in interactive mode, 10s with --timeout)")
     parser.add_argument("--reset", action="store_true",
                         help="Reset device before monitoring (1200 baud touch)")
     parser.add_argument("--bootloader", action="store_true",
@@ -404,7 +433,8 @@ def main():
         reset_via_baud_touch(port)
 
     monitor = SerialMonitor(port, args.baud, args.timestamps, args.timeout,
-                            exit_patterns=args.exit_on)
+                            exit_patterns=args.exit_on,
+                            reconnect_timeout=args.reconnect_timeout)
 
     # Parse --send arguments
     for item in args.send:
