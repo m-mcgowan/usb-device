@@ -50,10 +50,20 @@ Run any script with `--help` for usage details.
 brew install m-mcgowan/tap/usb-device
 ```
 
+This installs `usb-device`, `serial-monitor`, `hub-agent`, and all PlatformIO helper scripts (`pioupload`, `piotest`, `piomonitor`, `piosermon`, `piorun`) into your Homebrew bin directory.
+
 ### Script
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/m-mcgowan/usb-device/main/install.sh | bash
+```
+
+Installs to `~/.local/share/usb-device/` and symlinks `usb-device`, `serial-monitor`, `hub-agent` into `~/.local/bin/`. Add `~/.local/bin` to your PATH if it isn't already.
+
+The PlatformIO helper scripts (`pioupload`, `piotest`, etc.) are not symlinked by the script installer — add the install directory to PATH for these:
+
+```bash
+export PATH="$HOME/.local/share/usb-device:$PATH"
 ```
 
 ### Clone
@@ -63,6 +73,8 @@ git clone https://github.com/m-mcgowan/usb-device.git
 cd usb-device
 ./setup.sh
 ```
+
+`setup.sh` adds the repo directory to PATH in your shell profile and sources `shell-integration.sh` for the PlatformIO shell functions (`piodevlock`, `piodev`, `piodevunlock`). All scripts are on PATH immediately after sourcing.
 
 After installing, register your devices:
 

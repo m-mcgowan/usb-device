@@ -38,6 +38,14 @@ DB="${USB_DEVICE_DB:-$CONFIG_DIR/locations.json}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# Emit to stderr unless _checkout_quiet is set
+_checkout_msg() { [ "${_checkout_quiet:-0}" -eq 0 ] && echo "$*" >&2 || true; }
+
+# JSON string escaping (handles quotes, backslashes, newlines)
+_json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g'; }
+# Emit a JSON key-value pair: _json_kv key value → "key": "value"
+_json_kv() { printf '"%s": "%s"' "$1" "$(_json_str "$2")"; }
+
 # Globals set by resolve_device()
 RESOLVED_NAME=""
 RESOLVED_MAC=""
@@ -894,7 +902,7 @@ _checkout_one() {
 
         if mkdir "$lock_path" 2>/dev/null; then
             _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
-            echo "Checked out '$RESOLVED_NAME'" >&2
+            _checkout_msg "Checked out '$RESOLVED_NAME'"
             return 0
         fi
 
@@ -909,7 +917,7 @@ _checkout_one() {
                 local refcount
                 refcount=$(_lock_field "$lock_path" "REFCOUNT")
                 _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl" "${refcount:-1}"
-                echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+                _checkout_msg "Refreshed lock on '$RESOLVED_NAME'"
                 return 0
             elif _is_ancestor_pid "$lock_pid" "$my_pid"; then
                 # Child/ancestor — increment refcount (new holder)
@@ -919,7 +927,7 @@ _checkout_one() {
                     local new_count lock_comm
                     new_count=$(_lock_incref "$lock_path")
                     lock_comm=$(_lock_field "$lock_path" "COMM")
-                    echo "Acquired lock on '$RESOLVED_NAME' from ${lock_comm:-pid} $lock_pid (refcount=$new_count)" >&2
+                    _checkout_msg "Acquired lock on '$RESOLVED_NAME' from ${lock_comm:-pid} $lock_pid (refcount=$new_count)"
                     return 0
                 fi
             fi
@@ -930,7 +938,7 @@ _checkout_one() {
             local lock_owner
             lock_owner=$(_lock_field "$lock_path" "OWNER")
             if [ -n "$lock_owner" ] && [ "$lock_owner" = "$owner" ]; then
-                echo "Sharing lock on '$RESOLVED_NAME' (held by $lock_owner)" >&2
+                _checkout_msg "Sharing lock on '$RESOLVED_NAME' (held by $lock_owner)"
                 return 2
             fi
         fi
@@ -973,7 +981,8 @@ _checkout_any() {
 
         # Skip offline devices
         if [ -n "$mac" ] && ! _is_connected "$mac"; then
-            echo "skip: '$name' — offline" >&2
+            _checkout_msg "skip: '$name' — offline"
+            [ "${_checkout_quiet:-0}" -eq 1 ] && echo "SKIP_DEVICE='$name' SKIP_REASON='offline'"
             continue
         fi
 
@@ -985,7 +994,7 @@ _checkout_any() {
 
         if mkdir "$lock_path" 2>/dev/null; then
             _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl"
-            echo "Checked out '$RESOLVED_NAME'" >&2
+            _checkout_msg "Checked out '$RESOLVED_NAME'"
             _print_checkout_result
             return 0
         fi
@@ -998,7 +1007,7 @@ _checkout_any() {
                 local refcount
                 refcount=$(_lock_field "$lock_path" "REFCOUNT")
                 _write_lock_info "$lock_path" "$my_pid" "$owner" "$purpose" "$ttl" "${refcount:-1}"
-                echo "Refreshed lock on '$RESOLVED_NAME'" >&2
+                _checkout_msg "Refreshed lock on '$RESOLVED_NAME'"
                 _print_checkout_result
                 return 0
             elif _is_ancestor_pid "$lock_pid" "$my_pid"; then
@@ -1008,17 +1017,18 @@ _checkout_any() {
                     local new_count lock_comm
                     new_count=$(_lock_incref "$lock_path")
                     lock_comm=$(_lock_field "$lock_path" "COMM")
-                    echo "Acquired lock on '$RESOLVED_NAME' from ${lock_comm:-pid} $lock_pid (refcount=$new_count)" >&2
+                    _checkout_msg "Acquired lock on '$RESOLVED_NAME' from ${lock_comm:-pid} $lock_pid (refcount=$new_count)"
                     _print_checkout_result
                     return 0
                 fi
             fi
         fi
 
-        echo "skip: '$name' — locked" >&2
+        _checkout_msg "skip: '$name' — locked"
+        [ "${_checkout_quiet:-0}" -eq 1 ] && echo "SKIP_DEVICE='$name' SKIP_REASON='locked'"
     done
 
-    echo "No available devices match '$pattern'" >&2
+    _checkout_msg "No available devices match '$pattern'"
     return 1
 }
 
@@ -1061,6 +1071,7 @@ cmd_checkout() {
     local wait=0 timeout=0 owner="" purpose="" ttl="0" any=0
     _lock_shared=0
     _checkout_export=0
+    _checkout_quiet=0
 
     while [[ "${1:-}" == -* ]]; do
         case "$1" in
@@ -1073,10 +1084,11 @@ cmd_checkout() {
             --ttl)     ttl="$2"; shift 2 ;;
             --pid)     _lock_pid="$2"; shift 2 ;;
             --shared)  _lock_shared=1; shift ;;
+            --quiet|-q) _checkout_quiet=1; shift ;;
             *)         die "unknown flag: $1" ;;
         esac
     done
-    [ -n "${1:-}" ] || die "usage: usb-device checkout [--any] [--export] [--shared] [--wait] [--timeout N] [--owner STR] [--purpose STR] [--ttl N] [--pid PID] <name> [name ...]"
+    [ -n "${1:-}" ] || die "usage: usb-device checkout [--any] [--export] [--shared] [--wait] [--timeout N] [--owner STR] [--purpose STR] [--ttl N] [--pid PID] [--quiet] <name> [name ...]"
 
     mkdir -p "$LOCK_DIR"
     [ -n "$owner" ] || owner="$(whoami)@$(hostname -s)"
@@ -1363,13 +1375,17 @@ Commands:
   reset [-f|--force] <name>     Power-cycle a device (escalates to hub if needed)
   off <name>                    Turn off power to a device
   on <name>                     Turn on power to a device
-  port [-b|--bootloader] <name> Print /dev/cu.* path (--bootloader for upload port)
+  port [opts] <name>            Print /dev/cu.* path
+                                  -b, --bootloader: upload port
+                                  --wait SECS: poll until port appears
+  wait-online [-t SECS] <name> Block until device is connected (default: 30s)
   env <name>                    Print shell exports for PIO (eval-able)
   bootloader <name>             Enter bootloader (requires type plugin)
   boot <name>                   Exit bootloader (requires type plugin)
   checkout [opts] <name> [...]  Acquire exclusive access (sorted, all-or-nothing)
                                   --any: first available match (no prompt)
                                   --shared: join existing lock if same owner
+                                  --quiet: suppress stderr, structured skip on stdout
   checkin [-f] <name> [...]     Release exclusive access (must own the lock)
   checkin --mine                Release all locks held by this session (requires flag)
   locks [--mine|--prune]        Show checked-out devices (--mine: this session, --prune: remove stale)
@@ -1399,6 +1415,9 @@ Checkout options:
   --purpose STR                 Why (shown in locks output)
   --ttl N                       Auto-expire lock after N seconds (default: 0, no expiry)
   --pid PID                     Store PID for lock ownership (default: caller's PID)
+
+Global flags:
+  --json                        Machine-readable JSON output (list, find, scan)
 
 Chained commands (device name first, then one or more commands):
   usb-device "1.9" reset bootloader    # power-cycle then enter bootloader
@@ -1496,7 +1515,7 @@ cmd_check() {
 
 cmd_scan() {
     parse_config
-    echo "Scanning USB bus..."
+    [ "$JSON_OUTPUT" -eq 0 ] && echo "Scanning USB bus..."
     local found=0 updated=0
     db_init
 
@@ -1514,11 +1533,11 @@ cmd_scan() {
             # Check if uhubctl can see this hub
             if uhubctl -l "$hub" -p "$port" 2>/dev/null | grep -q "Port $port"; then
                 db_put "$name" "${mac:--}" "$hub" "$port" "static" "-"
-                printf "  %-30s  location=%-10s type=%-6s [verified]\n" "$name" "$location" "$type"
+                [ "$JSON_OUTPUT" -eq 0 ] && printf "  %-30s  location=%-10s type=%-6s [verified]\n" "$name" "$location" "$type"
                 found=$((found + 1))
                 updated=$((updated + 1))
             else
-                printf "  %-30s  location=%-10s type=%-6s [hub:port not found in uhubctl]\n" "$name" "$location" "$type"
+                [ "$JSON_OUTPUT" -eq 0 ] && printf "  %-30s  location=%-10s type=%-6s [hub:port not found in uhubctl]\n" "$name" "$location" "$type"
             fi
             continue
         fi
@@ -1537,7 +1556,7 @@ cmd_scan() {
                 mode=$(detect_device_mode "$mac")
                 [ "$mode" = "bootloader" ] && mode_tag="found, BOOTLOADER"
             fi
-            printf "  %-30s  hub=%-6s port=%-4s dev=%-25s [%s]\n" "$name" "$hub" "$port" "${serial_port:--}" "$mode_tag"
+            [ "$JSON_OUTPUT" -eq 0 ] && printf "  %-30s  hub=%-6s port=%-4s dev=%-25s [%s]\n" "$name" "$hub" "$port" "${serial_port:--}" "$mode_tag"
             found=$((found + 1))
             updated=$((updated + 1))
         elif [ -n "$serial_port" ]; then
@@ -1548,7 +1567,7 @@ cmd_scan() {
                 [ "$mode" = "bootloader" ] && mode_tag="found, BOOTLOADER, no power-switchable hub"
             fi
             db_put "$name" "$mac" "-" "-" "no-hub" "${serial_port}"
-            printf "  %-30s  dev=%-25s [%s]\n" "$name" "$serial_port" "$mode_tag"
+            [ "$JSON_OUTPUT" -eq 0 ] && printf "  %-30s  dev=%-25s [%s]\n" "$name" "$serial_port" "$mode_tag"
             found=$((found + 1))
             updated=$((updated + 1))
         else
@@ -1558,15 +1577,19 @@ cmd_scan() {
                 local cached_port cached_ts
                 cached_port=$(db_get "$name" "port")
                 cached_ts=$(db_get "$name" "last_seen")
-                printf "  %-30s  hub=%-6s port=%-4s %s [cached from %s]\n" "$name" "$cached_hub" "$cached_port" "" "$cached_ts"
+                [ "$JSON_OUTPUT" -eq 0 ] && printf "  %-30s  hub=%-6s port=%-4s %s [cached from %s]\n" "$name" "$cached_hub" "$cached_port" "" "$cached_ts"
             else
-                printf "  %-30s  %s\n" "$name" "[not found, no cached location]"
+                [ "$JSON_OUTPUT" -eq 0 ] && printf "  %-30s  %s\n" "$name" "[not found, no cached location]"
             fi
         fi
     done
 
-    echo ""
-    echo "Scan complete: $found device(s) found, $updated location(s) updated."
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        _list_json
+    else
+        echo ""
+        echo "Scan complete: $found device(s) found, $updated location(s) updated."
+    fi
 }
 
 # Auto-detect device type from USB product string
@@ -1742,6 +1765,9 @@ cmd_discover() {
 
 cmd_list() {
     parse_config
+
+    [ "$JSON_OUTPUT" -eq 1 ] && { _list_json; return; }
+
     echo "Registered devices:"
     echo ""
 
@@ -1792,6 +1818,61 @@ cmd_list() {
     done
 }
 
+_list_json() {
+    local first=1
+    echo "["
+    local i
+    for i in "${!DEVICE_NAMES[@]}"; do
+        local name="${DEVICE_NAMES[$i]}"
+        local mac="${DEVICE_MACS[$i]}"
+        local type="${DEVICE_TYPES[$i]}"
+        local location="${DEVICE_LOCATIONS[$i]}"
+        local chip="${DEVICE_CHIPS[$i]}"
+        local status="unknown" serial_port="" hub="" port=""
+
+        if [ -n "$location" ]; then
+            status="static"
+        elif [ -n "$mac" ]; then
+            serial_port=$(find_serial_port "$mac")
+            if result=$(find_hub_port_live "$mac" 2>/dev/null); then
+                read -r hub port _ <<< "$result"
+                status="connected"
+            elif [ -n "$serial_port" ]; then
+                status="connected"
+            else
+                status="offline"
+            fi
+        fi
+
+        # Lock status
+        local lock_status="available" lock_owner="" lock_purpose=""
+        mkdir -p "$LOCK_DIR"
+        if _is_locked "$name"; then
+            lock_status="locked"
+            lock_owner="$LOCK_OWNER"
+            lock_purpose="$LOCK_PURPOSE"
+        fi
+
+        [ "$first" -eq 1 ] && first=0 || printf ",\n"
+        printf "  {"
+        printf "%s" "$(_json_kv name "$name")"
+        printf ", %s" "$(_json_kv type "$type")"
+        [ -n "$mac" ] && printf ", %s" "$(_json_kv id "$mac")"
+        [ -n "$location" ] && printf ", %s" "$(_json_kv location "$location")"
+        [ -n "$chip" ] && printf ", %s" "$(_json_kv chip "$chip")"
+        printf ", %s" "$(_json_kv status "$status")"
+        [ -n "$serial_port" ] && printf ", %s" "$(_json_kv dev "$serial_port")"
+        [ -n "$hub" ] && printf ", %s" "$(_json_kv hub "$hub")"
+        [ -n "$port" ] && printf ", %s" "$(_json_kv port "$port")"
+        printf ", %s" "$(_json_kv lock "$lock_status")"
+        [ -n "$lock_owner" ] && printf ", %s" "$(_json_kv lock_owner "$lock_owner")"
+        [ -n "$lock_purpose" ] && printf ", %s" "$(_json_kv lock_purpose "$lock_purpose")"
+        printf "}"
+    done
+    echo ""
+    echo "]"
+}
+
 # Check if a device is locked (not stale). Returns 0 if locked, 1 if free.
 # Sets LOCK_OWNER, LOCK_PURPOSE, LOCK_PID if locked.
 _is_locked() {
@@ -1822,6 +1903,12 @@ _is_connected() {
 # Print info for a single resolved device (shared by cmd_find and _find_available).
 _print_device_info() {
     resolve_hub_port
+
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+        _print_device_info_json
+        return
+    fi
+
     echo "name: $RESOLVED_NAME"
     echo "type: $RESOLVED_TYPE"
     if [ -n "$RESOLVED_LOCATION" ]; then
@@ -1858,6 +1945,33 @@ _print_device_info() {
     else
         echo "lock: available"
     fi
+}
+
+_print_device_info_json() {
+    local serial_port=""
+    [ -n "$RESOLVED_MAC" ] && serial_port=$(find_serial_port "$RESOLVED_MAC")
+    local lock_status="available" lock_owner="" lock_purpose=""
+    mkdir -p "$LOCK_DIR"
+    if _is_locked "$RESOLVED_NAME"; then
+        lock_status="locked"
+        lock_owner="$LOCK_OWNER"
+        lock_purpose="$LOCK_PURPOSE"
+    fi
+
+    printf "{"
+    printf "%s" "$(_json_kv name "$RESOLVED_NAME")"
+    printf ", %s" "$(_json_kv type "$RESOLVED_TYPE")"
+    [ -n "$RESOLVED_MAC" ] && printf ", %s" "$(_json_kv id "$RESOLVED_MAC")"
+    [ -n "$RESOLVED_LOCATION" ] && printf ", %s" "$(_json_kv location "$RESOLVED_LOCATION")"
+    [ -n "$RESOLVED_CHIP" ] && printf ", %s" "$(_json_kv chip "$RESOLVED_CHIP")"
+    [ -n "$HUB" ] && printf ", %s" "$(_json_kv hub "$HUB")"
+    [ -n "$PORT" ] && printf ", %s" "$(_json_kv port "$PORT")"
+    [ -n "$serial_port" ] && printf ", %s" "$(_json_kv dev "$serial_port")"
+    printf ", %s" "$(_json_kv status "${CACHED:+offline}")"
+    printf ", %s" "$(_json_kv lock "$lock_status")"
+    [ -n "$lock_owner" ] && printf ", %s" "$(_json_kv lock_owner "$lock_owner")"
+    [ -n "$lock_purpose" ] && printf ", %s" "$(_json_kv lock_purpose "$lock_purpose")"
+    printf "}\n"
 }
 
 cmd_find() {
@@ -2167,10 +2281,11 @@ dispatch_type_action() {
 }
 
 cmd_port() {
-    local bootloader=0
+    local bootloader=0 wait_secs=0
     while [[ "${1:-}" == -* ]]; do
         case "$1" in
             --bootloader|-b) bootloader=1; shift ;;
+            --wait|-w)       wait_secs="$2"; shift 2 ;;
             *)               die "unknown flag: $1" ;;
         esac
     done
@@ -2178,15 +2293,49 @@ cmd_port() {
     if [ -n "${1:-}" ]; then
         resolve_device "$1"
     elif [ -z "$RESOLVED_NAME" ]; then
-        die "usage: usb-device port [-b|--bootloader] <name>"
+        die "usage: usb-device port [-b|--bootloader] [--wait SECS] <name>"
     fi
     if [ "$bootloader" -eq 1 ]; then
-        _resolve_bootloader_port || die "no bootloader port found for '$RESOLVED_NAME'"
-        echo "$RESOLVED_BOOTLOADER_PORT"
+        if [ "$wait_secs" -gt 0 ] 2>/dev/null; then
+            _wait_for_port "$wait_secs" 1 || die "bootloader port for '$RESOLVED_NAME' did not appear within ${wait_secs}s"
+            echo "$RESOLVED_BOOTLOADER_PORT"
+        else
+            _resolve_bootloader_port || die "no bootloader port found for '$RESOLVED_NAME'"
+            echo "$RESOLVED_BOOTLOADER_PORT"
+        fi
     else
-        require_serial_port
-        echo "$RESOLVED_PORT"
+        if [ "$wait_secs" -gt 0 ] 2>/dev/null; then
+            _wait_for_port "$wait_secs" 0 || die "port for '$RESOLVED_NAME' did not appear within ${wait_secs}s"
+            echo "$RESOLVED_PORT"
+        else
+            require_serial_port
+            echo "$RESOLVED_PORT"
+        fi
     fi
+}
+
+# Poll for a device port to appear. Args: $1=timeout_secs, $2=bootloader (0/1)
+# Returns 0 on success (sets RESOLVED_PORT or RESOLVED_BOOTLOADER_PORT), 1 on timeout.
+_wait_for_port() {
+    local timeout="$1" bootloader="$2"
+    local deadline=$(( $(date +%s) + timeout ))
+    local waited=0
+    while true; do
+        if [ "$bootloader" -eq 1 ]; then
+            _resolve_bootloader_port && return 0
+        else
+            RESOLVED_PORT=$(find_serial_port "$RESOLVED_MAC")
+            [ -n "$RESOLVED_PORT" ] && return 0
+        fi
+        if [ $(date +%s) -ge "$deadline" ]; then
+            return 1
+        fi
+        if [ "$waited" -eq 0 ]; then
+            echo "Waiting for '$RESOLVED_NAME' to appear..." >&2
+            waited=1
+        fi
+        sleep 0.5
+    done
 }
 
 # Resolve the bootloader port for the current device.
@@ -2233,11 +2382,55 @@ cmd_type() {
 # Print the value of an arbitrary key from a device's section in devices.conf.
 # Useful for project-specific metadata (e.g. notecard_uid, serial_number).
 # Exits non-zero and prints nothing if the key is absent.
+cmd_wait_online() {
+    local timeout=30
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            --timeout|-t) timeout="$2"; shift 2 ;;
+            *)            die "unknown flag: $1" ;;
+        esac
+    done
+    [ -n "${1:-}" ] || die "usage: usb-device wait-online [--timeout SECS] <name>"
+    resolve_device "$1"
+    [ -n "$RESOLVED_MAC" ] || die "'$RESOLVED_NAME' has no serial number — cannot detect online status"
+
+    if _is_connected "$RESOLVED_MAC"; then
+        return 0
+    fi
+
+    echo "Waiting for '$RESOLVED_NAME' to come online..." >&2
+    local deadline=$(( $(date +%s) + timeout ))
+    while true; do
+        if _is_connected "$RESOLVED_MAC"; then
+            echo "'$RESOLVED_NAME' is online" >&2
+            return 0
+        fi
+        if [ $(date +%s) -ge "$deadline" ]; then
+            die "'$RESOLVED_NAME' did not come online within ${timeout}s"
+        fi
+        sleep 0.5
+    done
+}
+
 cmd_field() {
     local name="$1" key="$2"
     [ -n "$name" ] || die "usage: usb-device field <name> <key>"
     [ -n "$key"  ] || die "usage: usb-device field <name> <key>"
-    USB_DEVICE_CONF="$CONF" "$PYTHON" -m usb_device field "$name" "$key"
+    # Try Python module first, fall back to awk for environments where
+    # the usb_device package isn't available (e.g. mock tests)
+    USB_DEVICE_CONF="$CONF" "$PYTHON" -m usb_device field "$name" "$key" 2>/dev/null && return 0
+    local val
+    val=$(awk -v section="[$name]" -v k="$key" '
+        $0 == section   { in_s=1; next }
+        /^\[/           { in_s=0 }
+        in_s && $0 ~ "^"k"[ \t]*=" {
+            sub(/^[^=]*=[ \t]*/, "")
+            print
+            exit
+        }
+    ' "$CONF")
+    [ -n "$val" ] || return 1
+    echo "$val"
 }
 
 cmd_partner() {
@@ -2414,6 +2607,12 @@ for p in comports():
 
 # ── Main dispatch ─────────────────────────────────────────────────
 
+# Global flags (parsed before command dispatch)
+JSON_OUTPUT=0
+while [[ "${1:-}" == --json ]]; do
+    JSON_OUTPUT=1; shift
+done
+
 # Commands that don't take a device name
 case "${1:-}" in
     version)        echo "usb-device $USB_DEVICE_VERSION"; exit ;;
@@ -2445,6 +2644,7 @@ dispatch_cmd() {
         boot)       cmd_boot "${1:-$RESOLVED_NAME}" ;;
         checkout)   cmd_checkout "$@" ;;
         checkin)    cmd_checkin "$@" ;;
+        wait-online) cmd_wait_online "$@" ;;
         *)          die "unknown command: $cmd" ;;
     esac
 }
@@ -2453,7 +2653,7 @@ dispatch_cmd() {
 # Chained:    usb-device <device> <cmd1> [cmd2] ...
 is_command() {
     case "$1" in
-        find|field|type|reset|off|on|port|env|bootloader|boot|checkout|checkin) return 0 ;;
+        find|field|type|reset|off|on|port|env|bootloader|boot|checkout|checkin|wait-online) return 0 ;;
         *) return 1 ;;
     esac
 }
