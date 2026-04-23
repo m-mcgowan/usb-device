@@ -1067,28 +1067,60 @@ _print_checkout_result() {
     fi
 }
 
+_checkout_help() {
+    cat <<'USAGE'
+usage: usb-device checkout [options] <name> [name ...]
+
+Acquire exclusive access to one or more devices. Flags and device names
+can appear in any order.
+
+Options:
+  --any              First available match (skip locked/offline)
+  --export           Output shell exports (eval-able) for PIO env vars
+  --shared           Join existing lock if held by same owner (exit 2)
+  --wait             Block until the device is available
+  --timeout N        Give up after N seconds (with --wait)
+  --owner STR        Who is checking out (default: user@host)
+  --purpose STR      Why (shown in locks output)
+  --ttl N            Auto-expire lock after N seconds (default: 0, no expiry)
+  --pid PID          Store PID for lock ownership (default: caller's PID)
+  --quiet, -q        Suppress stderr; emit structured SKIP_DEVICE/SKIP_REASON
+
+Examples:
+  usb-device checkout "1.10"
+  usb-device checkout --any --purpose "CI build" "MPCB"
+  usb-device checkout "MPCB 1.10 Development" --pid $PPID --purpose "test"
+  usb-device checkout --quiet --any "1.10"
+USAGE
+}
+
 cmd_checkout() {
     local wait=0 timeout=0 owner="" purpose="" ttl="0" any=0
     _lock_shared=0
     _checkout_export=0
     _checkout_quiet=0
 
-    while [[ "${1:-}" == -* ]]; do
+    # Parse flags and device names in any order
+    local device_args=()
+    while [ $# -gt 0 ]; do
         case "$1" in
-            --any)     any=1; shift ;;
-            --export)  _checkout_export=1; shift ;;
-            --wait)    wait=1; shift ;;
-            --timeout) timeout="$2"; shift 2 ;;
-            --owner)   owner="$2"; shift 2 ;;
-            --purpose) purpose="$2"; shift 2 ;;
-            --ttl)     ttl="$2"; shift 2 ;;
-            --pid)     _lock_pid="$2"; shift 2 ;;
-            --shared)  _lock_shared=1; shift ;;
+            --help|-h)  _checkout_help; exit 0 ;;
+            --any)      any=1; shift ;;
+            --export)   _checkout_export=1; shift ;;
+            --wait)     wait=1; shift ;;
+            --timeout)  timeout="$2"; shift 2 ;;
+            --owner)    owner="$2"; shift 2 ;;
+            --purpose)  purpose="$2"; shift 2 ;;
+            --ttl)      ttl="$2"; shift 2 ;;
+            --pid)      _lock_pid="$2"; shift 2 ;;
+            --shared)   _lock_shared=1; shift ;;
             --quiet|-q) _checkout_quiet=1; shift ;;
-            *)         die "unknown flag: $1" ;;
+            -*)         die "unknown flag: $1" ;;
+            *)          device_args+=("$1"); shift ;;
         esac
     done
-    [ -n "${1:-}" ] || die "usage: usb-device checkout [--any] [--export] [--shared] [--wait] [--timeout N] [--owner STR] [--purpose STR] [--ttl N] [--pid PID] [--quiet] <name> [name ...]"
+    set -- "${device_args[@]+"${device_args[@]}"}"
+    [ -n "${1:-}" ] || die "usage: usb-device checkout [opts] <name> [name ...] (try --help)"
 
     mkdir -p "$LOCK_DIR"
     [ -n "$owner" ] || owner="$(whoami)@$(hostname -s)"
@@ -1189,14 +1221,29 @@ _checkin_one() {
 
 cmd_checkin() {
     local force=0 mine=0
-    while [[ "${1:-}" == -* ]]; do
+    local device_args=()
+    while [ $# -gt 0 ]; do
         case "$1" in
+            --help|-h)  cat <<'USAGE'
+usage: usb-device checkin [options] <name> [name ...]
+       usb-device checkin --mine
+
+Release exclusive access to devices.
+
+Options:
+  -f, --force    Release even if not owned by this session
+  --mine         Release all locks held by this session
+  --pid PID      Use PID for ownership check (default: caller's PID)
+USAGE
+                        exit 0 ;;
             -f|--force) force=1; shift ;;
             --mine)     mine=1; shift ;;
             --pid)      _lock_pid="$2"; shift 2 ;;
-            *)          die "unknown flag: $1" ;;
+            -*)         die "unknown flag: $1" ;;
+            *)          device_args+=("$1"); shift ;;
         esac
     done
+    set -- "${device_args[@]+"${device_args[@]}"}"
 
     # No args without --mine: refuse (too easy to accidentally release all)
     if [ "$mine" -eq 0 ] && [ -z "${1:-}" ]; then
@@ -1978,6 +2025,16 @@ cmd_find() {
     local available=0
     while [[ "${1:-}" == -* ]]; do
         case "$1" in
+            --help|-h)      cat >&2 <<'USAGE'
+usage: usb-device find [options] <name>
+
+Show device info (hub, port, serial device, lock status).
+
+Options:
+  -a, --available   First connected+unlocked match (no prompt)
+  --json            Machine-readable JSON output (global flag)
+USAGE
+                            exit 0 ;;
             -a|--available) available=1; shift ;;
             *)              die "unknown flag: $1" ;;
         esac
@@ -2284,6 +2341,16 @@ cmd_port() {
     local bootloader=0 wait_secs=0
     while [[ "${1:-}" == -* ]]; do
         case "$1" in
+            --help|-h)       cat >&2 <<'USAGE'
+usage: usb-device port [options] <name>
+
+Print the serial device path (/dev/cu.*) for a device.
+
+Options:
+  -b, --bootloader   Print the bootloader/upload port
+  --wait SECS        Poll until port appears (for post-reset/wake)
+USAGE
+                             exit 0 ;;
             --bootloader|-b) bootloader=1; shift ;;
             --wait|-w)       wait_secs="$2"; shift 2 ;;
             *)               die "unknown flag: $1" ;;
@@ -2386,6 +2453,16 @@ cmd_wait_online() {
     local timeout=30
     while [[ "${1:-}" == -* ]]; do
         case "$1" in
+            --help|-h)    cat >&2 <<'USAGE'
+usage: usb-device wait-online [--timeout SECS] <name>
+
+Block until a device is connected (detected by pyserial or uhubctl).
+Exits 0 immediately if already connected.
+
+Options:
+  -t, --timeout SECS   Give up after SECS seconds (default: 30)
+USAGE
+                          exit 0 ;;
             --timeout|-t) timeout="$2"; shift 2 ;;
             *)            die "unknown flag: $1" ;;
         esac
