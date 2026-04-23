@@ -165,6 +165,37 @@ HOOKS_DIR="$REPO_ROOT/.git/hooks"
 HOOK_LINE="$SCRIPT_DIR/setup.sh --quick"
 
 if [ -d "$HOOKS_DIR" ]; then
+    # Pre-commit: shellcheck lint
+    PRE_COMMIT="$HOOKS_DIR/pre-commit"
+    if [ -f "$PRE_COMMIT" ] && grep -qF "shellcheck" "$PRE_COMMIT" 2>/dev/null; then
+        echo "[ok] pre-commit hook already installed"
+    else
+        cat > "$PRE_COMMIT" << 'HOOK'
+#!/bin/bash
+# Pre-commit hook: run shellcheck on staged shell scripts
+set -euo pipefail
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+shell_files=()
+for f in $staged; do
+    case "$f" in
+        usb-device|serial-monitor|hub-agent|setup.sh|install.sh|types.d/*.sh)
+            [ -f "$f" ] && shell_files+=("$f")
+            ;;
+    esac
+done
+if [ ${#shell_files[@]} -gt 0 ]; then
+    if command -v shellcheck &>/dev/null; then
+        echo "Running shellcheck on ${#shell_files[@]} file(s)..."
+        shellcheck "${shell_files[@]}"
+    else
+        echo "warning: shellcheck not installed, skipping lint" >&2
+    fi
+fi
+HOOK
+        chmod +x "$PRE_COMMIT"
+        echo "[ok] installed pre-commit hook (shellcheck)"
+    fi
+
     for hook_name in post-merge post-checkout post-rewrite; do
         HOOK_FILE="$HOOKS_DIR/$hook_name"
         if [ -f "$HOOK_FILE" ] && grep -qF "setup.sh --quick" "$HOOK_FILE" 2>/dev/null; then

@@ -1933,6 +1933,7 @@ _is_locked() {
     fi
     LOCK_OWNER=$(_lock_field "$lock_path" "OWNER")
     LOCK_PURPOSE=$(_lock_field "$lock_path" "PURPOSE")
+    # shellcheck disable=SC2034  # set for callers
     LOCK_PID=$(_lock_field "$lock_path" "PID")
     return 0
 }
@@ -2394,7 +2395,7 @@ _wait_for_port() {
             RESOLVED_PORT=$(find_serial_port "$RESOLVED_MAC")
             [ -n "$RESOLVED_PORT" ] && return 0
         fi
-        if [ $(date +%s) -ge "$deadline" ]; then
+        if [ "$(date +%s)" -ge "$deadline" ]; then
             return 1
         fi
         if [ "$waited" -eq 0 ]; then
@@ -2482,7 +2483,7 @@ USAGE
             echo "'$RESOLVED_NAME' is online" >&2
             return 0
         fi
-        if [ $(date +%s) -ge "$deadline" ]; then
+        if [ "$(date +%s)" -ge "$deadline" ]; then
             die "'$RESOLVED_NAME' did not come online within ${timeout}s"
         fi
         sleep 0.5
